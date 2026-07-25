@@ -2895,13 +2895,26 @@ function custom_truelysell_ajax_book_service() {
  * safety net — custom_truelysell_finalize_deposit_booking() is idempotent
  * (guarded by _truelysell_booking_created) so being called from two hooks
  * for the same order is harmless.
+ *
+ * IMPORTANT: the order_status_changed hook below is deliberately given
+ * priority 5, EARLIER than the plugin's own Truelysell_Core_Commissions::
+ * order_status_change() (registered at default priority 10 when the
+ * plugin loads, i.e. before this file even runs). Both listen to the same
+ * event — if the plugin's callback ran first, it would read owner_id/
+ * booking_id/listing_id from order meta that this code hasn't written yet
+ * (this function writes it), register a broken zero-value commission, AND
+ * mark the order as "commissions processed" — permanently blocking this
+ * function's own, correct commission registration. Running earlier avoids
+ * that entirely: by the time the plugin's callback runs in the same
+ * dispatch, the correct commission is already registered and the plugin
+ * sees "already processed" and skips.
  */
 add_action( 'woocommerce_payment_complete', 'custom_truelysell_create_booking_after_deposit_paid' );
 function custom_truelysell_create_booking_after_deposit_paid( $order_id ) {
     custom_truelysell_finalize_deposit_booking( $order_id, 'woocommerce_payment_complete' );
 }
 
-add_action( 'woocommerce_order_status_changed', 'custom_truelysell_create_booking_on_status_change', 10, 3 );
+add_action( 'woocommerce_order_status_changed', 'custom_truelysell_create_booking_on_status_change', 5, 3 );
 function custom_truelysell_create_booking_on_status_change( $order_id, $old_status, $new_status ) {
     if ( in_array( $new_status, array( 'processing', 'completed' ), true ) ) {
         custom_truelysell_finalize_deposit_booking( $order_id, 'woocommerce_order_status_changed (' . $old_status . ' -> ' . $new_status . ')' );
@@ -3013,6 +3026,8 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
     $order->update_meta_data( 'listing_id', $listing_id );
     $order->save_meta_data();
 
+    custom_truelysell_register_deposit_commission( $order, $owner_id, $booking_id, $listing_id, $deposit_amount );
+
     $remaining_balance = $full_price - $deposit_amount;
 
     // Notify the owner/technician
@@ -3041,6 +3056,64 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
         );
         wp_mail( $email, $subject, $body );
     }
+}
+
+/**
+ * Registers this deposit payment in the plugin's own commission/payout
+ * ledger (wp_truelysell_core_commissions — what [truelysell_wallet] /
+ * [truelysell_payout] and the admin Payouts screen read from), instead of
+ * relying on the plugin's own Truelysell_Core_Commissions::order_status_change()
+ * hook to do it natively.
+ *
+ * Why this is necessary: that native hook also listens on
+ * woocommerce_order_status_changed, registered when the plugin loads —
+ * i.e. BEFORE this theme's own hook on the same action, since plugins load
+ * before the theme. WordPress fires same-priority callbacks in
+ * registration order, so on the same status-change event the plugin's
+ * register_commission() runs and reads get_post_meta($order_id,'owner_id'
+ * /'booking_id'/'listing_id') BEFORE this function has had a chance to
+ * write that meta — so it registers a commission with a blank/0 user_id
+ * and the provider's earning never shows up. Registering it directly here,
+ * with the values already in hand, avoids that race entirely (and also
+ * sidesteps register_commission() reading via get_post_meta(), which
+ * would silently find nothing at all on a site using WooCommerce's
+ * newer HPOS custom order-tables storage).
+ *
+ * The commission is based on the 20% deposit only (not the full listing
+ * price) — Payout represents money that actually moved through the
+ * platform; the remaining balance is cash the provider collects directly
+ * and was never platform money.
+ */
+function custom_truelysell_register_deposit_commission( $order, $owner_id, $booking_id, $listing_id, $deposit_amount ) {
+	if ( ! class_exists( 'Truelysell_Core_Commissions' ) ) {
+		return;
+	}
+
+	if ( 'yes' === $order->get_meta( '_truelysell_commissions_processed' ) ) {
+		return;
+	}
+
+	$rate = function_exists( 'truelysell_fl_framework_getoptions' ) ? (float) truelysell_fl_framework_getoptions( 'commission_rate' ) / 100 : 0;
+
+	$commission_id = Truelysell_Core_Commissions::instance()->insert_commission( array(
+		'order_id'   => $order->get_id(),
+		'user_id'    => $owner_id,
+		'booking_id' => $booking_id,
+		'listing_id' => $listing_id,
+		'rate'       => $rate,
+		'status'     => 'unpaid',
+		'amount'     => (float) $deposit_amount * $rate,
+		'type'       => 'percentage',
+	) );
+
+	if ( $commission_id ) {
+		$order->update_meta_data( '_truelysell_commissions_id', $commission_id );
+		$order->update_meta_data( '_truelysell_commissions_processed', 'yes' );
+		$order->save_meta_data();
+		$order->add_order_note( sprintf( 'Truelysell: commission #%d registered (rate %s%%, on 20%% deposit of %s).', $commission_id, $rate * 100, wp_strip_all_tags( wc_price( $deposit_amount ) ) ) );
+	} else {
+		$order->add_order_note( 'Truelysell: FAILED to register commission — insert_commission() did not return an ID.' );
+	}
 }
 
 // ============================================================
