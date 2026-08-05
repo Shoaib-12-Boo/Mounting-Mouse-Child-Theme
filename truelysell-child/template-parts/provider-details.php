@@ -160,19 +160,7 @@ if ($provider_id) {
     </div>
   </div>
 
- <div class="provider-bio-info">
- <h6><i></i><?php echo esc_html('Address', 'truelysell'); ?></h6>
-    <?php
-    $profile_address = get_user_meta($provider_id, 'profile-address', true);
-    $profile_city = get_user_meta($provider_id, 'profile-city', true);
-    if (!empty($profile_address) && !empty($profile_city)) {
-    $full_address = '<span>' . $profile_address . '</span>, <span>' . $profile_city . '</span>';
-    echo '<p  class="mb-0">' . $full_address . '</p>';
-    } else {
-    echo '<p>No address available.</p>';
-    }
- ?>
-					  </div>
+ <?php /* Technician home address is private — used only internally for service-area matching, never shown to customers or other technicians. See functions.php. */ ?>
  </div>
 
 

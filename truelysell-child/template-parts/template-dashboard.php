@@ -361,6 +361,7 @@
 	$roles = $current_user->roles;
 
 	$role = array_shift($roles);
+	$role = custom_truelysell_normalize_dashboard_role( $role );
 
 	if (!in_array($role, array('administrator', 'admin', 'owner', 'seller', 'staff'))) {
 
@@ -459,6 +460,7 @@ if (in_array($role, array('administrator', 'admin', 'owner', 'seller', 'staff'))
 			$roles = $current_user->roles;
 
 			$role = array_shift($roles);
+			$role = custom_truelysell_normalize_dashboard_role( $role );
 
 			if (!empty($current_user->user_firstname)) {
 
@@ -1141,6 +1143,7 @@ if(isset($_GET["action"])) {
 			$roles = $current_user->roles;
 
 			$role = array_shift($roles);
+			$role = custom_truelysell_normalize_dashboard_role( $role );
 
 			if (!empty($current_user->user_firstname)) {
 

@@ -1067,6 +1067,68 @@ function custom_truelysell_is_restricted_provider( $user_id = 0 ) {
 	return false;
 }
 
+/**
+ * 'provider' is a leftover/orphan role (see custom_truelysell_is_restricted_provider()
+ * above — it was never registered via add_role(), only left on some
+ * accounts from earlier testing) that should be treated identically to
+ * 'owner' everywhere the dashboard template decides provider-vs-customer
+ * UI. Without this, a 'provider'-role technician fails every role
+ * whitelist check in template-dashboard.php and gets silently routed to
+ * the plain customer view — which is why they'd see zero bookings even
+ * though bookings are correctly stored against them.
+ */
+function custom_truelysell_normalize_dashboard_role( $role ) {
+	return ( 'provider' === $role ) ? 'owner' : $role;
+}
+
+/**
+ * One-time cleanup: convert any existing 'provider'-role accounts to the
+ * real, registered 'owner' role, so the codebase only has to reason about
+ * one "real technician" role going forward. Gated to run once, on an
+ * actual admin's wp-admin page load (no WP-CLI access assumed).
+ */
+add_action( 'admin_init', 'custom_truelysell_migrate_provider_role_to_owner_once' );
+function custom_truelysell_migrate_provider_role_to_owner_once() {
+	if ( ! current_user_can( 'manage_options' ) || get_option( '_truelysell_provider_role_migrated' ) ) {
+		return;
+	}
+
+	$provider_user_ids = get_users( array( 'role' => 'provider', 'fields' => 'ID' ) );
+	foreach ( $provider_user_ids as $uid ) {
+		$user = get_userdata( $uid );
+		if ( $user && in_array( 'provider', (array) $user->roles, true ) ) {
+			$user->remove_role( 'provider' );
+			$user->add_role( 'owner' );
+		}
+	}
+
+	update_option( '_truelysell_provider_role_migrated', array(
+		'ran_at'   => current_time( 'mysql' ),
+		'user_ids' => $provider_user_ids,
+	) );
+
+	if ( ! empty( $provider_user_ids ) ) {
+		set_transient( '_truelysell_provider_role_migration_notice', count( $provider_user_ids ), 60 );
+	}
+}
+
+add_action( 'admin_notices', 'custom_truelysell_show_provider_role_migration_notice' );
+function custom_truelysell_show_provider_role_migration_notice() {
+	$count = get_transient( '_truelysell_provider_role_migration_notice' );
+	if ( ! $count ) {
+		return;
+	}
+	delete_transient( '_truelysell_provider_role_migration_notice' );
+	printf(
+		'<div class="notice notice-success is-dismissible"><p>%s</p></div>',
+		esc_html( sprintf(
+			/* translators: %d: number of migrated accounts */
+			_n( 'Truelysell: migrated %d user from the legacy "provider" role to "owner".', 'Truelysell: migrated %d users from the legacy "provider" role to "owner".', $count, 'truelysell' ),
+			$count
+		) )
+	);
+}
+
 function custom_truelysell_cleanup_customer_provider_data( $user_id = 0 ) {
 	if ( ! $user_id ) {
 		return;
@@ -1358,7 +1420,7 @@ function custom_truelysell_wpforms_map_field_values_to_labels( $form_id, $field_
 
 	$choices = array(
 		'1332' => 'Ceiling TV Mounting',
-		'8298' => 'Ceiling TV Mounting',
+		'8298' => 'Economy: Above Fireplace',
 		'8055' => 'Conference Room Display Installation',
 		'1319' => 'Corner TV Mounting',
 		'5793' => 'Fireplace TV Mounting',
@@ -1747,17 +1809,13 @@ function custom_truelysell_reassign_bookings_to_technician() {
  * (truelysell-core/templates/single-listing.php) is hardcoded to
  * `$author_id = $post->post_author` — always the listing's original
  * author (Admin, for a shared catalog listing), with no hook to override
- * it. Customers should see the actual technician(s) offering this service
- * instead — they're who will actually show up to do the job, not the
- * generic Admin account.
- *
- * If only one provider is linked, swap the box to show them directly (as
- * before). If MULTIPLE providers are linked to this listing, add a
- * dropdown so the customer can pick which one to see full details for —
- * their choice is remembered (sessionStorage) so when they click "Book
- * Now" the booking modal's provider step is already resolved, without
- * making them enter their address and pick again from a nearby-provider
- * list.
+ * it. Show a real linked technician here instead, purely for general
+ * info (name/photo/rating) — NOT a picker. Per the service-area-matching
+ * spec, which technician actually gets assigned to a real booking is
+ * decided at booking time by distance from the customer's service
+ * address to each technician's private home address (see
+ * custom_truelysell_find_nearest_eligible_provider()), never by customer
+ * choice or by whichever technician happens to be shown on this page.
  */
 add_action( 'wp_footer', 'custom_truelysell_show_assigned_technician_as_provider' );
 function custom_truelysell_show_assigned_technician_as_provider() {
@@ -1903,8 +1961,6 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 		}
 
 		var providers = <?php echo wp_json_encode( $providers_data ); ?>;
-		var listingId = <?php echo wp_json_encode( (string) $listing_id ); ?>;
-		var storageKey = 'truelysell_selected_provider_' + listingId;
 
 		function replaceValueFor(labelText, newValue) {
 			var rows = document.querySelectorAll('.card-body .d-flex.justify-content-between');
@@ -1944,22 +2000,18 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 				replaceValueFor('Email', provider.email);
 			}
 			replaceValueFor('No of Listings', provider.listing_count);
-
-			try {
-				sessionStorage.setItem(storageKey, String(provider.id));
-				sessionStorage.setItem('truelysell_selected_provider_name_' + listingId, provider.name);
-			} catch (e) {}
 		}
 
-		var defaultId = <?php echo wp_json_encode( (string) $default_provider_id ); ?>;
-		var startId = defaultId;
-		try {
-			var stored = sessionStorage.getItem(storageKey);
-			if (stored && providers.some(function (p) { return String(p.id) === stored; })) {
-				startId = stored;
-			}
-		} catch (e) {}
-
+		/*
+		 * Just shows one representative technician for general info
+		 * (name/photo/rating) — which technician actually gets assigned
+		 * to a real booking is decided at booking time by distance from
+		 * the customer's service address (see
+		 * custom_truelysell_find_nearest_eligible_provider()), not by
+		 * whichever one happens to be displayed here. So this is
+		 * intentionally NOT a picker anymore — no dropdown, no carried-
+		 * over selection into the booking modal.
+		 */
 		function findProvider(id) {
 			for (var i = 0; i < providers.length; i++) {
 				if (String(providers[i].id) === String(id)) return providers[i];
@@ -1967,33 +2019,8 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 			return providers[0];
 		}
 
-		applyProvider(findProvider(startId));
-
-		// Only add a picker when there's actually more than one to choose from.
-		if (providers.length > 1) {
-			var picker = document.createElement('div');
-			picker.className = 'mt-3';
-			picker.innerHTML = '<label class="form-label fw-medium fs-13 mb-1">Choose a Provider</label>';
-
-			var select = document.createElement('select');
-			select.className = 'form-select form-select-sm';
-			providers.forEach(function (p) {
-				var opt = document.createElement('option');
-				opt.value = p.id;
-				opt.textContent = p.name;
-				if (String(p.id) === String(startId)) {
-					opt.selected = true;
-				}
-				select.appendChild(opt);
-			});
-
-			select.addEventListener('change', function () {
-				applyProvider(findProvider(select.value));
-			});
-
-			picker.appendChild(select);
-			box.querySelector('.card-body').appendChild(picker);
-		}
+		var defaultId = <?php echo wp_json_encode( (string) $default_provider_id ); ?>;
+		applyProvider(findProvider(defaultId));
 	});
 	</script>
 	<?php
@@ -2445,10 +2472,6 @@ function custom_truelysell_render_provider_services_card_inner( $user_id = 0 ) {
 										</p>
 										<h6 class="provider-service-price mb-0"><?php echo esc_html( custom_truelysell_format_listing_price( $listing_id ) ); ?> <?php echo custom_truelysell_get_listing_was_price_html( $listing_id ); ?></h6>
 									</div>
-									<?php $duration_text = custom_truelysell_get_listing_duration_text( $listing_id ); ?>
-									<?php if ( $duration_text ) : ?>
-										<p class="mb-0 fs-12 text-muted mt-1"><i class="ti ti-clock me-1"></i><?php echo esc_html( $duration_text ); ?></p>
-									<?php endif; ?>
 									<?php if ( $is_own_listing ) : ?>
 										<div class="d-flex justify-content-between align-items-center gap-2 mt-3">
 											<?php if ( $edit_url ) : ?>
@@ -2477,12 +2500,29 @@ function custom_truelysell_render_provider_services_card_inner( $user_id = 0 ) {
 									?>
 									<div class="mt-3 pt-3 border-top truelysell-listing-availability" data-listing-id="<?php echo esc_attr( $listing_id ); ?>">
 										<p class="mb-2 fs-12 text-muted"><?php esc_html_e( 'Available for this service on:', 'truelysell' ); ?></p>
-										<div class="d-flex flex-wrap gap-2 mb-2">
-											<?php foreach ( $week_days as $day_key => $day_label ) : ?>
-												<label class="form-check d-flex align-items-center gap-1 mb-0">
-													<input type="checkbox" class="form-check-input truelysell-availability-day" value="<?php echo esc_attr( $day_key ); ?>" <?php checked( in_array( $day_key, $listing_available_days, true ) ); ?>>
-													<span class="form-check-label fs-12"><?php echo esc_html( $day_label ); ?></span>
-												</label>
+										<div class="d-flex flex-column gap-2 mb-2">
+											<?php foreach ( $week_days as $day_key => $day_label ) :
+												$is_checked  = in_array( $day_key, $listing_available_days, true );
+												$day_hours   = custom_truelysell_get_provider_listing_hours_for_day( $user_id, $listing_id, $day_key );
+												$has_range   = '00:00' !== $day_hours['start'] || '23:59' !== $day_hours['end'];
+												$start_value = $has_range ? $day_hours['start'] : '09:00';
+												$end_value   = $has_range ? $day_hours['end'] : '17:00';
+											?>
+												<div class="truelysell-availability-day-row border rounded p-2">
+													<label class="form-check d-flex align-items-center gap-2 mb-2">
+														<input type="checkbox" class="form-check-input truelysell-availability-day" value="<?php echo esc_attr( $day_key ); ?>" <?php checked( $is_checked ); ?>>
+														<span class="form-check-label fw-medium fs-12"><?php echo esc_html( $day_label ); ?></span>
+													</label>
+													<div class="d-flex align-items-center gap-2">
+														<select class="form-select form-select-sm truelysell-availability-start" <?php disabled( ! $is_checked ); ?>>
+															<?php echo custom_truelysell_time_select_options( $start_value ); ?>
+														</select>
+														<span class="fs-12 text-muted"><?php esc_html_e( 'to', 'truelysell' ); ?></span>
+														<select class="form-select form-select-sm truelysell-availability-end" <?php disabled( ! $is_checked ); ?>>
+															<?php echo custom_truelysell_time_select_options( $end_value ); ?>
+														</select>
+													</div>
+												</div>
 											<?php endforeach; ?>
 										</div>
 										<button type="button" class="btn btn-outline-secondary btn-sm truelysell-save-availability"><?php esc_html_e( 'Save Availability', 'truelysell' ); ?></button>
@@ -2949,43 +2989,20 @@ function custom_truelysell_inject_customer_booking_modal() {
                                 </div>
                             </div>
 
-                            <div class="row g-3 mb-3" id="preselected-provider-wrapper" style="display:none;">
-                                <div class="col-md-12">
-                                    <div class="alert alert-success d-flex align-items-center justify-content-between mb-0">
-                                        <span><i class="ti ti-circle-check-filled me-1"></i> <?php esc_html_e( 'Booking with:', 'truelysell' ); ?> <strong id="preselected-provider-name"></strong></span>
-                                        <a href="javascript:void(0);" id="preselected-provider-change" class="text-danger"><?php esc_html_e( 'Change', 'truelysell' ); ?></a>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="row g-3 mb-3" id="service-providers-wrapper">
-                                <div class="col-md-12">
-                                    <label class="form-label fw-medium mb-2"><?php esc_html_e( 'Select a Provider', 'truelysell' ); ?> <span class="text-danger">*</span></label>
-
-                                    <div id="service-providers-zip-prompt" style="display:none;" class="mb-2">
-                                        <div class="input-group">
-                                            <input type="text" id="service-providers-zip-input" class="form-control" placeholder="<?php esc_attr_e( 'Enter your Zip Code', 'truelysell' ); ?>">
-                                            <button type="button" class="btn btn-outline-primary" id="service-providers-zip-submit"><?php esc_html_e( 'Find Providers', 'truelysell' ); ?></button>
-                                        </div>
-                                        <div class="fs-12 text-muted mt-1"><?php esc_html_e( 'We match you with providers in your zip code. You can also set this permanently in your profile.', 'truelysell' ); ?></div>
-                                    </div>
-
-                                    <div id="service-providers-list" class="d-flex flex-column gap-2">
-                                        <div class="text-muted fs-13"><?php esc_html_e( 'Loading providers...', 'truelysell' ); ?></div>
-                                    </div>
-                                </div>
-                            </div>
-
                             <div class="row g-3 mb-3">
                                 <div class="col-md-12">
-                                    <label class="form-label fw-medium"><?php esc_html_e( 'Your Address', 'truelysell' ); ?> <span class="text-danger">*</span></label>
-                                    <input type="text" id="customer-booking-address" class="form-control" placeholder="<?php esc_attr_e( 'Start typing your address...', 'truelysell' ); ?>" autocomplete="off">
-                                    <div class="fs-12 text-muted mt-1"><?php esc_html_e( 'Used so the provider knows where to go.', 'truelysell' ); ?></div>
+                                    <label class="form-label fw-medium"><?php esc_html_e( 'Your Service Address', 'truelysell' ); ?> <span class="text-danger">*</span></label>
+                                    <input type="text" name="customer_address" id="customer-booking-address" class="form-control" placeholder="<?php esc_attr_e( 'Start typing your address...', 'truelysell' ); ?>" autocomplete="off" required>
+                                    <div class="fs-12 text-muted mt-1"><?php esc_html_e( 'We use this to match you with the nearest available technician who serves your area.', 'truelysell' ); ?></div>
                                     <div id="customer-booking-map" style="display:none; height:220px; margin-top:10px; border-radius:8px; overflow:hidden;"></div>
                                     <input type="hidden" name="customer_lat" id="customer-booking-lat">
                                     <input type="hidden" name="customer_lng" id="customer-booking-lng">
                                     <input type="hidden" name="selected_provider_id" id="customer-selected-provider-id">
                                 </div>
+                            </div>
+
+                            <div class="row g-3 mb-3" id="service-providers-wrapper" style="display:none;">
+                                <div class="col-md-12" id="service-providers-list"></div>
                             </div>
 
                             <div class="row g-3 mb-3">
@@ -3058,24 +3075,87 @@ function custom_truelysell_inject_customer_booking_modal() {
      * regardless (it's output earlier in the page than this script), so
      * it's safe to call this at any time.
      */
-    function customTruelysellFetchServiceProviders(typedZip) {
+    var customTruelysellAssignedProviderDays = null;
+    var customTruelysellAssignedProviderHours = null;
+    var customTruelysellProvidersData = null;
+
+    function customTruelysellSelectProvider(providerId) {
+        var list = document.getElementById('service-providers-list');
+        if (!list || !customTruelysellProvidersData) return;
+
+        var picked = null;
+        for (var i = 0; i < customTruelysellProvidersData.length; i++) {
+            if (String(customTruelysellProvidersData[i].id) === String(providerId)) {
+                picked = customTruelysellProvidersData[i];
+                break;
+            }
+        }
+        if (!picked) return;
+
+        document.getElementById('customer-selected-provider-id').value = picked.id;
+        customTruelysellAssignedProviderDays = picked.available_days || null;
+        customTruelysellAssignedProviderHours = picked.available_hours || null;
+
+        list.querySelectorAll('.truelysell-provider-card').forEach(function (card) {
+            var isSelected = String(card.getAttribute('data-provider-id')) === String(picked.id);
+            card.classList.toggle('border-primary', isSelected);
+            var check = card.querySelector('.truelysell-provider-check');
+            if (check) check.style.visibility = isSelected ? 'visible' : 'hidden';
+        });
+
+        customTruelysellCheckPreferredDateAvailability();
+    }
+
+    function customTruelysellRenderProviderCards(providers, showDistance) {
+        var list = document.getElementById('service-providers-list');
+        if (!list) return;
+
+        var html = '<div class="fs-13 text-muted mb-2">Choose your technician:</div>';
+        providers.forEach(function (p, idx) {
+            var badge = (showDistance && idx === 0) ? ' <span class="badge bg-success ms-1"><i class="ti ti-map-pin-filled me-1"></i>Nearest provider</span>' : '';
+            var distanceLine = showDistance ? ('<div class="fs-12 text-muted">about ' + p.distance_miles + ' miles away</div>') : '';
+            html += '<div class="card mb-2 truelysell-provider-card' + (idx === 0 ? ' border-primary' : '') + '" data-provider-id="' + p.id + '" style="cursor:pointer;">' +
+                '<div class="card-body d-flex align-items-center gap-2 py-2">' +
+                    '<img src="' + p.avatar + '" alt="" style="width:36px;height:36px;border-radius:50%;object-fit:cover;">' +
+                    '<div class="flex-grow-1">' +
+                        '<div><strong>' + p.name + '</strong>' + badge + '</div>' +
+                        distanceLine +
+                    '</div>' +
+                    '<i class="ti ti-circle-check-filled text-primary truelysell-provider-check" style="' + (idx === 0 ? '' : 'visibility:hidden;') + '"></i>' +
+                '</div>' +
+            '</div>';
+        });
+        list.innerHTML = html;
+
+        list.querySelectorAll('.truelysell-provider-card').forEach(function (card) {
+            card.addEventListener('click', function () {
+                customTruelysellSelectProvider(card.getAttribute('data-provider-id'));
+            });
+        });
+    }
+
+    function customTruelysellFindNearestProvider(lat, lng) {
         var listingId = document.getElementById('booking-listing-id').value;
         var wrap = document.getElementById('service-providers-wrapper');
         var list = document.getElementById('service-providers-list');
-        var zipPrompt = document.getElementById('service-providers-zip-prompt');
+        var submitBtn = document.getElementById('submit-customer-booking');
         if (!wrap || !list || !listingId) return;
 
         document.getElementById('customer-selected-provider-id').value = '';
-        var preselectWrap = document.getElementById('preselected-provider-wrapper');
-        if (preselectWrap) preselectWrap.style.display = 'none';
+        customTruelysellAssignedProviderDays = null;
+        customTruelysellAssignedProviderHours = null;
+        customTruelysellProvidersData = null;
         wrap.style.display = 'block';
-        if (zipPrompt) zipPrompt.style.display = 'none';
-        list.innerHTML = '<div class="text-muted fs-13">Loading providers...</div>';
+        wrap.setAttribute('data-out-of-area', '0');
+        wrap.setAttribute('data-out-of-hours', '0');
+        list.innerHTML = '<div class="text-muted fs-13"><span class="spinner-border spinner-border-sm me-2"></span>Finding a technician near you...</div>';
+        if (submitBtn) submitBtn.disabled = true;
 
         var formData = new FormData();
         formData.append('action', 'custom_truelysell_get_service_providers');
         formData.append('listing_id', listingId);
-        if (typedZip) formData.append('customer_zip', typedZip);
+        formData.append('lat', lat);
+        formData.append('lng', lng);
 
         fetch('<?php echo esc_js( admin_url( 'admin-ajax.php' ) ); ?>', {
             method: 'POST',
@@ -3084,70 +3164,66 @@ function custom_truelysell_inject_customer_booking_modal() {
         .then(function (r) { return r.json(); })
         .then(function (data) {
             var payload = data.success && data.data ? data.data : {};
-            var providers = payload.providers || [];
+            if (submitBtn) submitBtn.disabled = false;
 
-            if (payload.need_zip) {
-                wrap.setAttribute('data-has-providers', '0');
-                list.innerHTML = '';
-                if (zipPrompt) zipPrompt.style.display = 'block';
+            if (payload.assigned && payload.providers && payload.providers.length) {
+                customTruelysellProvidersData = payload.providers;
+                var firstProvider = payload.providers[0];
+                document.getElementById('customer-selected-provider-id').value = firstProvider.id;
+                customTruelysellAssignedProviderDays = firstProvider.available_days || null;
+                customTruelysellAssignedProviderHours = firstProvider.available_hours || null;
+                wrap.setAttribute('data-out-of-area', '0');
+                customTruelysellRenderProviderCards(payload.providers, true);
+                customTruelysellCheckPreferredDateAvailability();
                 return;
             }
 
-            // Lets the submit handler know whether a selection is actually
-            // required — if nobody in this zip code offers this service,
-            // the server falls back to its default owner, so the customer
-            // shouldn't be blocked from booking over it.
-            wrap.setAttribute('data-has-providers', providers.length ? '1' : '0');
-
-            if (!providers.length) {
-                list.innerHTML = '<div class="alert alert-warning mb-0">' +
-                    '<i class="ti ti-alert-triangle me-1"></i>No technicians are currently available in your area (zip ' + (payload.customer_zip || '') + ').' +
-                    ' <a href="javascript:void(0);" id="service-providers-zip-retry">Try a different zip code</a>' +
-                    '</div>';
-                var retryLink = document.getElementById('service-providers-zip-retry');
-                if (retryLink) {
-                    retryLink.addEventListener('click', function () {
-                        if (zipPrompt) zipPrompt.style.display = 'block';
-                        list.innerHTML = '';
-                    });
-                }
-                return;
-            }
-
-            list.innerHTML = '';
-            window.customTruelysellProviderAvailability = {};
-            providers.forEach(function (p) {
-                window.customTruelysellProviderAvailability[p.id] = p.available_days || [];
-
-                var card = document.createElement('div');
-                card.className = 'border rounded p-2 d-flex align-items-center gap-2 service-provider-card';
-                card.style.cursor = 'pointer';
-                card.setAttribute('data-provider-id', p.id);
-                card.innerHTML =
-                    '<img src="' + p.avatar + '" alt="" style="width:36px;height:36px;border-radius:50%;object-fit:cover;">' +
-                    '<div class="flex-grow-1">' +
-                        '<div class="fw-medium">' + p.name + '</div>' +
-                    '</div>' +
-                    '<i class="ti ti-circle provider-select-icon"></i>';
-
-                card.addEventListener('click', function () {
-                    list.querySelectorAll('.service-provider-card').forEach(function (c) {
-                        c.classList.remove('border-primary', 'bg-primary-transparent');
-                        var icon = c.querySelector('.provider-select-icon');
-                        if (icon) icon.className = 'ti ti-circle provider-select-icon';
-                    });
-                    card.classList.add('border-primary', 'bg-primary-transparent');
-                    var icon = card.querySelector('.provider-select-icon');
-                    if (icon) icon.className = 'ti ti-circle-check-filled text-primary provider-select-icon';
-                    document.getElementById('customer-selected-provider-id').value = p.id;
-                    customTruelysellCheckPreferredDateAvailability();
+            var debugHtml = '';
+            if (payload.debug && payload.debug.length) {
+                debugHtml = '<div class="alert alert-warning mt-2 mb-0 fs-12"><strong>Admin only — why no technician matched:</strong><ul class="mb-0 ps-3">';
+                payload.debug.forEach(function (d) {
+                    debugHtml += '<li>' + d.name + ': ' + d.issue + '</li>';
                 });
+                debugHtml += '</ul></div>';
+            }
 
-                list.appendChild(card);
-            });
+            if (payload.fallback && payload.providers && payload.providers.length) {
+                // Nobody linked to this service has finished their
+                // address/radius setup, so we can't say who's "nearest" —
+                // but there ARE real technicians linked to it, so let the
+                // customer pick one directly instead of a vague message.
+                customTruelysellProvidersData = payload.providers;
+                var firstManualProvider = payload.providers[0];
+                document.getElementById('customer-selected-provider-id').value = firstManualProvider.id;
+                customTruelysellAssignedProviderDays = firstManualProvider.available_days || null;
+                customTruelysellAssignedProviderHours = firstManualProvider.available_hours || null;
+                wrap.setAttribute('data-out-of-area', '0');
+                customTruelysellRenderProviderCards(payload.providers, false);
+                customTruelysellCheckPreferredDateAvailability();
+                if (debugHtml) list.innerHTML += debugHtml;
+                return;
+            }
+
+            if (payload.fallback) {
+                // Truly nobody real linked to this listing at all — let
+                // the booking through (server-side falls back to the
+                // listing's default owner), but still say something
+                // instead of silently showing nothing.
+                wrap.style.display = 'block';
+                list.innerHTML = '<div class="alert alert-secondary mb-0"><i class="ti ti-info-circle me-1"></i>We\'ll assign the best available technician for your area and confirm shortly.</div>' + debugHtml;
+                return;
+            }
+
+            // Genuinely out of area — the spec's exact required message,
+            // and this DOES block booking since there's truly nobody to
+            // assign it to.
+            wrap.setAttribute('data-out-of-area', '1');
+            list.innerHTML = '<div class="alert alert-danger mb-0"><i class="ti ti-alert-triangle me-1"></i>' + (payload.message || 'Sorry, we do not currently service your area.') + '</div>' + debugHtml;
+            if (submitBtn) submitBtn.disabled = true;
         })
         .catch(function () {
-            list.innerHTML = '<div class="alert alert-danger mb-0">Could not load providers. Please try again.</div>';
+            if (submitBtn) submitBtn.disabled = false;
+            list.innerHTML = '<div class="alert alert-danger mb-0">Could not check availability. Please try again.</div>';
         });
     }
 
@@ -3157,13 +3233,16 @@ function custom_truelysell_inject_customer_booking_modal() {
     function customTruelysellCheckPreferredDateAvailability() {
         var warningEl = document.getElementById('preferred-date-availability-warning');
         var dateInput = document.getElementById('customer-preferred-date');
-        var providerId = document.getElementById('customer-selected-provider-id').value;
+        var timeInput = document.getElementById('customer-preferred-time');
+        var wrap = document.getElementById('service-providers-wrapper');
         if (!warningEl || !dateInput) return;
 
-        var availability = window.customTruelysellProviderAvailability || {};
-        var days = providerId ? availability[providerId] : null;
+        var days = customTruelysellAssignedProviderDays;
+        var hours = customTruelysellAssignedProviderHours;
 
-        if (!dateInput.value || !providerId || !days) {
+        if (wrap) wrap.setAttribute('data-out-of-hours', '0');
+
+        if (!dateInput.value || !days) {
             warningEl.style.display = 'none';
             return;
         }
@@ -3176,11 +3255,22 @@ function custom_truelysell_inject_customer_booking_modal() {
         var dayLabel = picked.toLocaleDateString(undefined, { weekday: 'long' });
 
         if (days.indexOf(dayKey) === -1) {
-            warningEl.innerHTML = '<i class="ti ti-alert-triangle me-1"></i>Heads up: this provider isn’t generally available on ' + dayLabel + 's. They may still be able to accommodate you — they’ll confirm when they contact you.';
+            warningEl.innerHTML = '<i class="ti ti-alert-triangle me-1"></i>Sorry, your selected technician isn’t available on ' + dayLabel + 's. Please choose a different date, or pick a different technician above.';
             warningEl.style.display = 'block';
-        } else {
-            warningEl.style.display = 'none';
+            if (wrap) wrap.setAttribute('data-out-of-hours', '1');
+            return;
         }
+
+        var timeVal = timeInput ? timeInput.value : '';
+        var range = hours && hours[dayKey] ? hours[dayKey] : null;
+        if (timeVal && range && (timeVal < range.start || timeVal >= range.end)) {
+            warningEl.innerHTML = '<i class="ti ti-alert-triangle me-1"></i>Your selected technician is only available on ' + dayLabel + 's between ' + range.start + ' and ' + range.end + '. Please pick a time in that range.';
+            warningEl.style.display = 'block';
+            if (wrap) wrap.setAttribute('data-out-of-hours', '1');
+            return;
+        }
+
+        warningEl.style.display = 'none';
     }
 
     function customTruelysellInitBookingAddressAutocomplete() {
@@ -3189,10 +3279,11 @@ function custom_truelysell_inject_customer_booking_modal() {
 
         var autocomplete = new google.maps.places.Autocomplete(input, { types: ['address'] });
 
-        // Address is informational only now (so the provider knows where
-        // to go) — it no longer drives provider search, so this just
-        // captures lat/lng and drops a pin on a small preview map so the
-        // customer can visually confirm the right spot.
+        // Selecting a real address is what drives eligibility matching
+        // now — this is the customer's service address, geocoded and
+        // checked against every linked technician's home-address +
+        // travel-radius to find (and auto-assign) the nearest one who
+        // actually covers this location.
         autocomplete.addListener('place_changed', function () {
             var place = autocomplete.getPlace();
             if (!place || !place.geometry) return;
@@ -3204,29 +3295,31 @@ function custom_truelysell_inject_customer_booking_modal() {
             document.getElementById('customer-booking-lng').value = lng;
 
             var mapEl = document.getElementById('customer-booking-map');
-            if (!mapEl) return;
+            if (mapEl) {
+                mapEl.style.display = 'block';
 
-            mapEl.style.display = 'block';
+                if (!customTruelysellBookingMap) {
+                    customTruelysellBookingMap = new google.maps.Map(mapEl, {
+                        center: place.geometry.location,
+                        zoom: 15
+                    });
+                    customTruelysellBookingMarker = new google.maps.Marker({
+                        position: place.geometry.location,
+                        map: customTruelysellBookingMap
+                    });
+                } else {
+                    customTruelysellBookingMap.setCenter(place.geometry.location);
+                    customTruelysellBookingMarker.setPosition(place.geometry.location);
+                }
 
-            if (!customTruelysellBookingMap) {
-                customTruelysellBookingMap = new google.maps.Map(mapEl, {
-                    center: place.geometry.location,
-                    zoom: 15
-                });
-                customTruelysellBookingMarker = new google.maps.Marker({
-                    position: place.geometry.location,
-                    map: customTruelysellBookingMap
-                });
-            } else {
+                // Modal display can hide the map on first paint (0 width
+                // at creation time) — nudge Maps to recalculate its size
+                // now that it's actually visible.
+                google.maps.event.trigger(customTruelysellBookingMap, 'resize');
                 customTruelysellBookingMap.setCenter(place.geometry.location);
-                customTruelysellBookingMarker.setPosition(place.geometry.location);
             }
 
-            // Modal display can hide the map on first paint (0 width at
-            // creation time) — nudge Maps to recalculate its size now that
-            // it's actually visible.
-            google.maps.event.trigger(customTruelysellBookingMap, 'resize');
-            customTruelysellBookingMap.setCenter(place.geometry.location);
+            customTruelysellFindNearestProvider(lat, lng);
         });
     }
 
@@ -3263,44 +3356,23 @@ function custom_truelysell_inject_customer_booking_modal() {
                 document.getElementById('customer-booking-lat').value = '';
                 document.getElementById('customer-booking-lng').value = '';
                 document.getElementById('customer-selected-provider-id').value = '';
+                customTruelysellAssignedProviderDays = null;
+                customTruelysellAssignedProviderHours = null;
+                customTruelysellProvidersData = null;
                 var mapEl = document.getElementById('customer-booking-map');
                 if (mapEl) mapEl.style.display = 'none';
                 var providersWrap = document.getElementById('service-providers-wrapper');
-                if (providersWrap) providersWrap.setAttribute('data-has-providers', '0');
+                if (providersWrap) {
+                    providersWrap.style.display = 'none';
+                    providersWrap.setAttribute('data-out-of-area', '0');
+                    providersWrap.setAttribute('data-out-of-hours', '0');
+                }
                 var providersList = document.getElementById('service-providers-list');
-                if (providersList) providersList.innerHTML = '<div class="text-muted fs-13">Loading providers...</div>';
-                var zipPromptReset = document.getElementById('service-providers-zip-prompt');
-                if (zipPromptReset) zipPromptReset.style.display = 'none';
-                var zipInputReset = document.getElementById('service-providers-zip-input');
-                if (zipInputReset) zipInputReset.value = '';
+                if (providersList) providersList.innerHTML = '';
                 var preferredDateReset = document.getElementById('customer-preferred-date');
                 if (preferredDateReset) preferredDateReset.value = '';
                 var availabilityWarningReset = document.getElementById('preferred-date-availability-warning');
                 if (availabilityWarningReset) availabilityWarningReset.style.display = 'none';
-
-                // If the customer already picked a provider from the
-                // dropdown on the listing page itself, honor that choice
-                // here instead of making them pick again.
-                var preselectWrap = document.getElementById('preselected-provider-wrapper');
-                var preselectName = document.getElementById('preselected-provider-name');
-                var listingIdVal = document.getElementById('booking-listing-id').value;
-                var storedProviderId = null;
-                var storedProviderName = '';
-                try {
-                    storedProviderId = sessionStorage.getItem('truelysell_selected_provider_' + listingIdVal);
-                    storedProviderName = sessionStorage.getItem('truelysell_selected_provider_name_' + listingIdVal) || '';
-                } catch (e) {}
-
-                if (storedProviderId) {
-                    document.getElementById('customer-selected-provider-id').value = storedProviderId;
-                    if (preselectWrap) preselectWrap.style.display = 'block';
-                    if (preselectName) preselectName.textContent = storedProviderName;
-                    if (providersWrap) providersWrap.style.display = 'none';
-                } else {
-                    if (preselectWrap) preselectWrap.style.display = 'none';
-                    if (providersWrap) providersWrap.style.display = 'block';
-                    customTruelysellFetchServiceProviders();
-                }
             });
         });
 
@@ -3311,41 +3383,13 @@ function custom_truelysell_inject_customer_booking_modal() {
             customTruelysellInitBookingAddressAutocomplete();
         }
 
-        var preselectChangeLink = document.getElementById('preselected-provider-change');
-        if (preselectChangeLink) {
-            preselectChangeLink.addEventListener('click', function () {
-                var listingIdVal = document.getElementById('booking-listing-id').value;
-                try {
-                    sessionStorage.removeItem('truelysell_selected_provider_' + listingIdVal);
-                    sessionStorage.removeItem('truelysell_selected_provider_name_' + listingIdVal);
-                } catch (e) {}
-
-                document.getElementById('customer-selected-provider-id').value = '';
-                var preselectWrap = document.getElementById('preselected-provider-wrapper');
-                if (preselectWrap) preselectWrap.style.display = 'none';
-
-                var providersWrap = document.getElementById('service-providers-wrapper');
-                if (providersWrap) providersWrap.style.display = 'block';
-                customTruelysellFetchServiceProviders();
-            });
-        }
-
-        var zipSubmitBtn = document.getElementById('service-providers-zip-submit');
-        if (zipSubmitBtn) {
-            zipSubmitBtn.addEventListener('click', function () {
-                var zipInput = document.getElementById('service-providers-zip-input');
-                var zipVal = zipInput ? zipInput.value.trim() : '';
-                if (!zipVal) {
-                    if (zipInput) zipInput.focus();
-                    return;
-                }
-                customTruelysellFetchServiceProviders(zipVal);
-            });
-        }
-
         var preferredDateInput = document.getElementById('customer-preferred-date');
         if (preferredDateInput) {
             preferredDateInput.addEventListener('change', customTruelysellCheckPreferredDateAvailability);
+        }
+        var preferredTimeInput = document.getElementById('customer-preferred-time');
+        if (preferredTimeInput) {
+            preferredTimeInput.addEventListener('change', customTruelysellCheckPreferredDateAvailability);
         }
 
         // Form submission
@@ -3361,12 +3405,16 @@ function custom_truelysell_inject_customer_booking_modal() {
                     return;
                 }
 
-                var selectedProviderId = document.getElementById('customer-selected-provider-id').value;
-                var providersWrapEl = document.getElementById('service-providers-wrapper');
-                var providersAvailable = providersWrapEl && providersWrapEl.getAttribute('data-has-providers') === '1';
+                var addressVal = document.getElementById('customer-booking-address').value;
+                var customerLatVal = document.getElementById('customer-booking-lat').value;
+                if (!addressVal || !customerLatVal) {
+                    if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-warning mt-2">Please select your service address from the suggestions.</div>';
+                    return;
+                }
 
-                if (providersAvailable && !selectedProviderId) {
-                    if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-warning mt-2">Please select a provider.</div>';
+                var providersWrapEl = document.getElementById('service-providers-wrapper');
+                if (providersWrapEl && providersWrapEl.getAttribute('data-out-of-area') === '1') {
+                    if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-danger mt-2">Sorry, we do not currently service your area.</div>';
                     return;
                 }
 
@@ -3374,6 +3422,11 @@ function custom_truelysell_inject_customer_booking_modal() {
                 var preferredTimeVal = document.getElementById('customer-preferred-time').value;
                 if (!preferredDateVal || !preferredTimeVal) {
                     if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-warning mt-2">Please select a preferred date and time.</div>';
+                    return;
+                }
+
+                if (providersWrapEl && providersWrapEl.getAttribute('data-out-of-hours') === '1') {
+                    if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-danger mt-2">The selected technician is not available at that day/time. Please choose a different date/time, or pick a different technician above.</div>';
                     return;
                 }
 
@@ -3413,102 +3466,240 @@ function custom_truelysell_inject_customer_booking_modal() {
 }
 
 // ============================================================
-// AJAX HANDLER: get every provider linked to a listing (no distance/
-// radius filtering — the customer just picks directly from the full list)
+// AUTO-ASSIGNMENT ENGINE — every eligible technician within their own
+// travel radius, per the formal spec: technician home address is entered
+// once in their profile and NEVER shown to anyone; only used server-side
+// to compute eligibility. All eligible technicians are shown to the
+// customer (nearest pre-selected/badged); the customer may pick any of
+// them, but the server always re-validates the choice is still eligible.
 // ============================================================
 
-/**
- * Every actual restricted-provider linked to a listing, formatted for the
- * booking modal's picker. Shared by the AJAX display endpoint below and
- * the booking submission handler's server-side validation, so the two can
- * never disagree.
- *
- * When $customer_zip is given, this only returns providers whose own
- * profile "Postal Code" (the native my-account field, same one every
- * customer/provider already has) exactly matches it — real zip-based
- * matching, using data already collected today, no new profile fields
- * needed.
- */
 function custom_truelysell_all_week_days() {
 	return array( 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun' );
 }
 
-function custom_truelysell_get_service_providers_for_listing( $listing_id, $customer_zip = '' ) {
-	$provider_ids = custom_truelysell_get_listing_linked_provider_ids( $listing_id );
-	$results      = array();
-	$customer_zip = trim( (string) $customer_zip );
+/**
+ * Great-circle distance between two lat/lng points, in miles (the spec's
+ * example radius is given in miles).
+ */
+function custom_truelysell_haversine_miles( $lat1, $lng1, $lat2, $lng2 ) {
+	$earth_radius_miles = 3958.8;
 
-	foreach ( $provider_ids as $provider_id ) {
-		if ( ! custom_truelysell_is_restricted_provider( $provider_id ) ) {
-			continue; // admin/site-owner isn't a field technician
-		}
+	$lat1 = deg2rad( (float) $lat1 );
+	$lng1 = deg2rad( (float) $lng1 );
+	$lat2 = deg2rad( (float) $lat2 );
+	$lng2 = deg2rad( (float) $lng2 );
 
-		if ( '' !== $customer_zip ) {
-			$provider_zip = trim( (string) get_user_meta( $provider_id, 'profile-postalcode', true ) );
-			if ( '' === $provider_zip || 0 !== strcasecmp( $provider_zip, $customer_zip ) ) {
-				continue; // exact zip match only
-			}
-		}
+	$delta_lat = $lat2 - $lat1;
+	$delta_lng = $lng2 - $lng1;
 
-		$user_info = get_userdata( $provider_id );
-		if ( ! $user_info ) {
-			continue;
-		}
+	$a = sin( $delta_lat / 2 ) ** 2 + cos( $lat1 ) * cos( $lat2 ) * sin( $delta_lng / 2 ) ** 2;
+	$c = 2 * atan2( sqrt( $a ), sqrt( 1 - $a ) );
 
-		$available_days = custom_truelysell_get_provider_listing_available_days( $provider_id, $listing_id );
+	return $earth_radius_miles * $c;
+}
 
-		$results[] = array(
-			'id'             => $provider_id,
-			'name'           => $user_info->display_name,
-			'avatar'         => get_avatar_url( $provider_id, array( 'size' => 60 ) ),
-			'available_days' => $available_days,
+/**
+ * Every technician linked to $listing_id whose own travel radius (from
+ * their home address, set once in their profile and never exposed here or
+ * anywhere customer-facing) actually covers the customer's given lat/lng,
+ * sorted nearest-first (ties broken by provider ID, so exact/near ties
+ * render in a stable order instead of "whoever linked first").
+ *
+ * Returns array( 'providers' => array( array(id, name, avatar,
+ * available_days, available_hours, distance_miles), ... ) ) sorted
+ * nearest-first, or array( 'no_technicians_configured' => true ) if
+ * nobody's set up their address/radius yet (caller should fall back to
+ * the pre-existing default owner rather than block every booking
+ * site-wide before providers have had a chance to fill this in), or
+ * array( 'out_of_area' => true ) if at least one technician IS configured
+ * but none of their radii reach this customer — the spec's actual "we do
+ * not currently service your area" case.
+ */
+function custom_truelysell_find_nearest_eligible_provider( $listing_id, $customer_lat, $customer_lng ) {
+	$provider_ids  = custom_truelysell_get_listing_linked_provider_ids( $listing_id );
+	$configured    = array(); // providers who HAVE set address + radius
+	$eligible      = array(); // of those, ones whose radius covers this customer
+	$diagnostics   = array(); // admin-only: why each linked provider didn't qualify
+
+	if ( empty( $provider_ids ) ) {
+		return array(
+			'no_technicians_configured' => true,
+			'diagnostics'               => array( array( 'name' => '—', 'issue' => 'No technicians are linked to this listing at all.' ) ),
 		);
 	}
 
-	return $results;
+	foreach ( $provider_ids as $provider_id ) {
+		$provider_user = get_userdata( $provider_id );
+		$provider_name = $provider_user ? $provider_user->display_name : ( 'User #' . $provider_id );
+
+		if ( ! custom_truelysell_is_restricted_provider( $provider_id ) ) {
+			$diagnostics[] = array( 'name' => $provider_name, 'issue' => 'Not recognized as an active technician account (role/is_technician check failed).' );
+			continue;
+		}
+
+		$provider_lat    = get_user_meta( $provider_id, 'profile-lat', true );
+		$provider_lng    = get_user_meta( $provider_id, 'profile-lng', true );
+		$provider_radius = get_user_meta( $provider_id, 'profile-travel-radius-miles', true );
+
+		$missing = array();
+		if ( '' === $provider_lat || '' === $provider_lng ) {
+			$missing[] = 'home address';
+		}
+		if ( ! $provider_radius ) {
+			$missing[] = 'travel radius';
+		}
+		if ( ! empty( $missing ) ) {
+			$diagnostics[] = array( 'name' => $provider_name, 'issue' => 'Missing ' . implode( ' and ', $missing ) . ' on their profile.' );
+			continue; // hasn't finished setting up their profile yet
+		}
+
+		$configured[] = $provider_id;
+
+		$distance = custom_truelysell_haversine_miles( $customer_lat, $customer_lng, $provider_lat, $provider_lng );
+		if ( $distance > absint( $provider_radius ) ) {
+			$diagnostics[] = array( 'name' => $provider_name, 'issue' => sprintf( 'Profile is configured, but this address is %s miles away — outside their %d-mile travel radius.', round( $distance, 1 ), absint( $provider_radius ) ) );
+			continue; // outside THIS technician's own radius
+		}
+
+		$eligible[] = array( 'id' => $provider_id, 'distance' => $distance );
+	}
+
+	if ( empty( $configured ) ) {
+		/*
+		 * Nobody linked to this listing has finished their address/radius
+		 * setup, so we can't do real distance matching yet — but there ARE
+		 * real technicians linked to this service, so let the customer
+		 * pick one directly instead of leaving them with no named option
+		 * at all. No distance/hours-based "nearest" badge here since we
+		 * genuinely can't compute it; availability (days/hours) is still
+		 * included and still enforced at booking time.
+		 */
+		$manual_pick_providers = array();
+		foreach ( $provider_ids as $provider_id ) {
+			if ( ! custom_truelysell_is_restricted_provider( $provider_id ) ) {
+				continue;
+			}
+			$user_info = get_userdata( $provider_id );
+			if ( ! $user_info ) {
+				continue;
+			}
+			$manual_pick_providers[] = array(
+				'id'              => $provider_id,
+				'name'            => $user_info->display_name,
+				'avatar'          => get_avatar_url( $provider_id, array( 'size' => 60 ) ),
+				'available_days'  => custom_truelysell_get_provider_listing_available_days( $provider_id, $listing_id ),
+				'available_hours' => custom_truelysell_get_provider_listing_hours_map( $provider_id, $listing_id ),
+			);
+		}
+
+		return array(
+			'no_technicians_configured' => true,
+			'manual_pick_providers'     => $manual_pick_providers,
+			'diagnostics'               => $diagnostics,
+		);
+	}
+
+	if ( empty( $eligible ) ) {
+		return array( 'out_of_area' => true, 'diagnostics' => $diagnostics );
+	}
+
+	usort( $eligible, function ( $a, $b ) {
+		$cmp = $a['distance'] <=> $b['distance'];
+		return 0 !== $cmp ? $cmp : $a['id'] <=> $b['id'];
+	} );
+
+	$providers = array();
+	foreach ( $eligible as $entry ) {
+		$user_info = get_userdata( $entry['id'] );
+		if ( ! $user_info ) {
+			continue;
+		}
+		$providers[] = array(
+			'id'              => $entry['id'],
+			'name'            => $user_info->display_name,
+			'avatar'          => get_avatar_url( $entry['id'], array( 'size' => 60 ) ),
+			'available_days'  => custom_truelysell_get_provider_listing_available_days( $entry['id'], $listing_id ),
+			'available_hours' => custom_truelysell_get_provider_listing_hours_map( $entry['id'], $listing_id ),
+			'distance_miles'  => round( $entry['distance'], 1 ),
+		);
+	}
+
+	if ( empty( $providers ) ) {
+		return array( 'out_of_area' => true );
+	}
+
+	return array( 'providers' => $providers );
 }
 
 add_action( 'wp_ajax_custom_truelysell_get_service_providers', 'custom_truelysell_ajax_get_service_providers' );
 add_action( 'wp_ajax_nopriv_custom_truelysell_get_service_providers', 'custom_truelysell_ajax_get_service_providers' );
 function custom_truelysell_ajax_get_service_providers() {
 	$listing_id = isset( $_POST['listing_id'] ) ? absint( $_POST['listing_id'] ) : 0;
+	$lat        = isset( $_POST['lat'] ) ? (float) $_POST['lat'] : null;
+	$lng        = isset( $_POST['lng'] ) ? (float) $_POST['lng'] : null;
 
-	if ( ! $listing_id ) {
-		wp_send_json_error( 'Missing listing.' );
+	if ( ! $listing_id || null === $lat || null === $lng ) {
+		wp_send_json_error( 'Missing listing or address.' );
 	}
 
-	$user_id = get_current_user_id();
+	$result       = custom_truelysell_find_nearest_eligible_provider( $listing_id, $lat, $lng );
+	$admin_debug  = current_user_can( 'manage_options' ) ? ( $result['diagnostics'] ?? array() ) : array();
 
-	// Prefer the zip explicitly submitted (customer typed one in the
-	// modal this session) over their saved profile zip, so a one-time
-	// override doesn't require editing their profile.
-	$customer_zip = isset( $_POST['customer_zip'] ) ? sanitize_text_field( wp_unslash( $_POST['customer_zip'] ) ) : '';
-	if ( '' === $customer_zip && $user_id ) {
-		$customer_zip = get_user_meta( $user_id, 'profile-postalcode', true );
-	}
-
-	// No zip on file and none typed yet — ask for one instead of silently
-	// showing everyone (that silence is exactly what caused confusion
-	// about whether zip matching does anything at all).
-	if ( '' === $customer_zip ) {
+	if ( ! empty( $result['out_of_area'] ) ) {
 		wp_send_json_success( array(
-			'need_zip'  => true,
-			'providers' => array(),
+			'assigned' => false,
+			'message'  => __( 'Sorry, we do not currently service your area.', 'truelysell' ),
+			'debug'    => $admin_debug,
 		) );
 	}
 
-	$providers = custom_truelysell_get_service_providers_for_listing( $listing_id, $customer_zip );
+	if ( ! empty( $result['no_technicians_configured'] ) ) {
+		// Nobody linked to this service has finished their address/radius
+		// setup, so real distance matching isn't possible yet — but if
+		// there are actual technicians linked, let the customer pick one
+		// directly rather than leaving it a mystery. Only falls all the
+		// way back to a silent default (in the submission handler) if
+		// there's truly nobody real to choose from either.
+		wp_send_json_success( array(
+			'assigned' => false,
+			'fallback' => true,
+			'providers' => $result['manual_pick_providers'] ?? array(),
+			'debug'    => $admin_debug,
+		) );
+	}
 
 	wp_send_json_success( array(
-		'need_zip'     => false,
-		'providers'    => $providers,
-		'customer_zip' => $customer_zip,
+		'assigned'  => true,
+		'providers' => $result['providers'],
 	) );
 }
 
 // ============================================================
 // AJAX HANDLER: customer_book_service
 // ============================================================
+/**
+ * Hard server-side gate: rejects (via wp_send_json_error, which halts
+ * execution) if $owner_id isn't available on the listing's $preferred_date
+ * (day-of-week) or that day's saved time range. Shared by both the
+ * geo-matched and manual-pick assignment paths in
+ * custom_truelysell_ajax_book_service() below.
+ */
+function custom_truelysell_enforce_booking_time_or_fail( $owner_id, $listing_id, $preferred_date, $preferred_time ) {
+	$weekday_map = array( 'Mon' => 'mon', 'Tue' => 'tue', 'Wed' => 'wed', 'Thu' => 'thu', 'Fri' => 'fri', 'Sat' => 'sat', 'Sun' => 'sun' );
+	$day_key     = $weekday_map[ date( 'D', strtotime( $preferred_date ) ) ] ?? '';
+	$avail_days  = custom_truelysell_get_provider_listing_available_days( $owner_id, $listing_id );
+
+	if ( ! $day_key || ! in_array( $day_key, $avail_days, true ) ) {
+		wp_send_json_error( __( 'Sorry, the selected technician is not available on that day. Please choose a different date, or pick a different technician.', 'truelysell' ) );
+	}
+
+	$hours = custom_truelysell_get_provider_listing_hours_for_day( $owner_id, $listing_id, $day_key );
+	if ( $preferred_time < $hours['start'] || $preferred_time >= $hours['end'] ) {
+		wp_send_json_error( __( 'Sorry, the selected technician is not available at that time. Please choose a different time, or pick a different technician.', 'truelysell' ) );
+	}
+}
+
 add_action( 'wp_ajax_customer_book_service', 'custom_truelysell_ajax_book_service' );
 function custom_truelysell_ajax_book_service() {
 
@@ -3530,6 +3721,7 @@ function custom_truelysell_ajax_book_service() {
     $email        = sanitize_email( $_POST['email'] ?? '' );
     $phone        = sanitize_text_field( $_POST['phone'] ?? '' );
     $message      = sanitize_textarea_field( $_POST['message'] ?? '' );
+    $customer_address = sanitize_text_field( $_POST['customer_address'] ?? '' );
 
     /*
      * Required so the provider always has a starting point to plan
@@ -3567,33 +3759,66 @@ function custom_truelysell_ajax_book_service() {
     }
 
     /*
-     * The customer picks a specific provider from the full list of
-     * everyone linked to this listing (see
-     * custom_truelysell_ajax_get_service_providers()) — that choice is
-     * what determines who actually gets credited for this booking, not
-     * just the listing's post_author. Re-validate against the listing's
-     * own linked-provider list here (never trust the client's selection
-     * alone).
+     * The system auto-assigns the nearest technician whose own travel
+     * radius (from their private home address) covers the customer's
+     * service address — never the customer's own choice. Recompute this
+     * ourselves server-side from the submitted lat/lng (never trust the
+     * client's selected_provider_id alone).
      *
-     * Fallback: if this listing has no linked providers at all, don't
-     * hard-block the booking. Fall back to the pre-existing default
-     * (_assigned_technician_id, else the listing's post_author) instead,
-     * same as before this feature existed.
+     * Fallback: if nobody linked to this listing has finished setting up
+     * their address/radius yet, don't hard-block every booking on the
+     * site over that — fall back to the pre-existing default
+     * (_assigned_technician_id, else the listing's post_author).
      */
-    $selected_provider_id = isset( $_POST['selected_provider_id'] ) ? absint( $_POST['selected_provider_id'] ) : 0;
-    $service_providers    = custom_truelysell_get_service_providers_for_listing( $listing_id );
+    $customer_lat = isset( $_POST['customer_lat'] ) && '' !== $_POST['customer_lat'] ? (float) $_POST['customer_lat'] : null;
+    $customer_lng = isset( $_POST['customer_lng'] ) && '' !== $_POST['customer_lng'] ? (float) $_POST['customer_lng'] : null;
 
-    if ( ! empty( $service_providers ) ) {
-        $service_provider_ids = wp_list_pluck( $service_providers, 'id' );
+    if ( null === $customer_lat || null === $customer_lng ) {
+        wp_send_json_error( 'Please select your service address from the suggestions.' );
+    }
 
-        if ( ! $selected_provider_id || ! in_array( $selected_provider_id, $service_provider_ids, true ) ) {
-            wp_send_json_error( 'Please select a provider.' );
+    $match = custom_truelysell_find_nearest_eligible_provider( $listing_id, $customer_lat, $customer_lng );
+
+    if ( ! empty( $match['out_of_area'] ) ) {
+        wp_send_json_error( __( 'Sorry, we do not currently service your area.', 'truelysell' ) );
+    }
+
+    if ( ! empty( $match['no_technicians_configured'] ) ) {
+        /*
+         * Nobody linked to this listing has finished their address/radius
+         * setup, so real distance matching wasn't possible — but if there
+         * ARE real technicians linked (manual_pick_providers), the
+         * customer picked one directly from that list client-side. Trust
+         * it only if it's genuinely one of those linked technicians.
+         */
+        $selected_provider_id = absint( $_POST['selected_provider_id'] ?? 0 );
+        $manual_provider_ids  = wp_list_pluck( $match['manual_pick_providers'] ?? array(), 'id' );
+
+        if ( $selected_provider_id && in_array( $selected_provider_id, $manual_provider_ids, true ) ) {
+            $owner_id = $selected_provider_id;
+            custom_truelysell_enforce_booking_time_or_fail( $owner_id, $listing_id, $preferred_date, $preferred_time );
+        } else {
+            // Truly nobody real to pick from — last-resort legacy default.
+            $assigned_technician_id = absint( get_post_meta( $listing_id, '_assigned_technician_id', true ) );
+            $owner_id               = $assigned_technician_id ? $assigned_technician_id : $listing_post->post_author;
+        }
+    } else {
+        /*
+         * The customer can pick any technician shown in the eligible list
+         * (nearest is pre-selected/badged client-side) — trust that choice
+         * as long as it's actually one of the technicians we just computed
+         * as eligible ourselves. Never trust the client's name/distance,
+         * only the ID, and only if it's still in today's eligible set.
+         */
+        $selected_provider_id  = absint( $_POST['selected_provider_id'] ?? 0 );
+        $eligible_provider_ids = wp_list_pluck( $match['providers'], 'id' );
+        if ( $selected_provider_id && in_array( $selected_provider_id, $eligible_provider_ids, true ) ) {
+            $owner_id = $selected_provider_id;
+        } else {
+            $owner_id = $match['providers'][0]['id']; // nearest — already sorted
         }
 
-        $owner_id = $selected_provider_id;
-    } else {
-        $assigned_technician_id = absint( get_post_meta( $listing_id, '_assigned_technician_id', true ) );
-        $owner_id               = $assigned_technician_id ? $assigned_technician_id : $listing_post->post_author;
+        custom_truelysell_enforce_booking_time_or_fail( $owner_id, $listing_id, $preferred_date, $preferred_time );
     }
 
     // Get product ID linked to this listing
@@ -3650,6 +3875,7 @@ function custom_truelysell_ajax_book_service() {
         'email'      => $email,
         'phone'      => $phone,
         'country'    => $country,
+        'address_1'  => $customer_address,
     );
     $order->set_address( $address, 'billing' );
     $order->set_address( $address, 'shipping' );
@@ -3667,6 +3893,9 @@ function custom_truelysell_ajax_book_service() {
     $order->update_meta_data( '_truelysell_email', $email );
     $order->update_meta_data( '_truelysell_phone', $phone );
     $order->update_meta_data( '_truelysell_message', $message );
+    $order->update_meta_data( '_truelysell_customer_address', $customer_address );
+    $order->update_meta_data( '_truelysell_customer_lat', $customer_lat );
+    $order->update_meta_data( '_truelysell_customer_lng', $customer_lng );
     $order->update_meta_data( '_truelysell_preferred_date', $preferred_date );
     $order->update_meta_data( '_truelysell_preferred_time', $preferred_time );
     $order->update_meta_data( '_truelysell_full_price', $normal_price );
@@ -3750,6 +3979,7 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
     $email          = $order->get_meta( '_truelysell_email' );
     $phone          = $order->get_meta( '_truelysell_phone' );
     $message        = $order->get_meta( '_truelysell_message' );
+    $customer_address = $order->get_meta( '_truelysell_customer_address' );
     $preferred_date = $order->get_meta( '_truelysell_preferred_date' );
     $preferred_time = $order->get_meta( '_truelysell_preferred_time' );
     $full_price     = (float) $order->get_meta( '_truelysell_full_price' );
@@ -3775,6 +4005,12 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
             'preferred_time' => $preferred_time,
             'deposit_paid'   => $deposit_amount,
             'total_price'    => $full_price,
+            'address'        => array(
+                'billing_address_1' => $customer_address,
+                'billing_city'      => '',
+                'billing_state'     => '',
+                'billing_postcode'  => '',
+            ),
         ),
     ) );
 
@@ -3856,10 +4092,10 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
     if ( $owner_info && is_email( $owner_info->user_email ) ) {
         $subject = sprintf( __( 'New Booking (Deposit Paid): %s', 'truelysell' ), get_the_title( $listing_id ) );
         $body    = sprintf(
-            "A new booking has been made and the 20%% deposit has been paid.\n\nService: %s\nCustomer: %s %s (%s)\nPhone: %s\nPreferred Date/Time: %s\nMessage: %s\n\nDeposit Paid: %s\nRemaining Balance (collect from customer): %s\n\nPlease contact the customer to confirm or adjust the time.\n\nBooking ID: #%d",
+            "A new booking has been made and the 20%% deposit has been paid.\n\nService: %s\nCustomer: %s %s (%s)\nPhone: %s\nService Address: %s\nPreferred Date/Time: %s\nMessage: %s\n\nDeposit Paid: %s\nRemaining Balance (collect from customer): %s\n\nPlease contact the customer to confirm or adjust the time.\n\nBooking ID: #%d",
             get_the_title( $listing_id ),
             $first_name, $last_name, $email,
-            $phone, $preferred_text, $message,
+            $phone, ( $customer_address ?: 'Not provided' ), $preferred_text, $message,
             wp_strip_all_tags( wc_price( $deposit_amount ) ), wp_strip_all_tags( wc_price( $remaining_balance ) ),
             $booking_id
         );
@@ -3868,13 +4104,16 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
 
     // Confirmation to the customer
     if ( is_email( $email ) ) {
+        $technician_name = $owner_info ? $owner_info->display_name : __( 'a technician', 'truelysell' );
         $subject = sprintf( __( 'Booking Confirmation: %s', 'truelysell' ), get_the_title( $listing_id ) );
         $body    = sprintf(
-            "Thank you for your booking!\n\nService: %s\nPreferred Date/Time: %s\nDeposit Paid: %s\nRemaining Balance Due: %s\n\nBooking ID: #%d\n\nThe provider will contact you shortly to confirm the time.",
+            "Thank you for your booking!\n\nService: %s\nTechnician: %s\nPreferred Date/Time: %s\nDeposit Paid: %s\nRemaining Balance Due: %s\n\nBooking ID: #%d\n\n%s will contact you shortly to confirm the time.",
             get_the_title( $listing_id ),
+            $technician_name,
             $preferred_text,
             wp_strip_all_tags( wc_price( $deposit_amount ) ), wp_strip_all_tags( wc_price( $remaining_balance ) ),
-            $booking_id
+            $booking_id,
+            $technician_name
         );
         wp_mail( $email, $subject, $body );
     }
@@ -4542,155 +4781,6 @@ function custom_truelysell_save_assigned_technician_metabox( $post_id ) {
 	} else {
 		delete_post_meta( $post_id, '_assigned_technician_id' );
 	}
-}
-
-// ============================================================
-// SERVICE DURATION
-// Admin-settable "how long this service takes" (e.g. 30 min, 1h) — stored
-// as whole minutes (_service_duration_minutes) and shown formatted
-// wherever a service appears on the frontend: the single listing page,
-// catalog cards (grid + list), and the provider's "My Services" dashboard.
-// Uses a standalone add_meta_box() (not the plugin's CMB2 tabs) since
-// that's the pattern already proven reliable in this project.
-// ============================================================
-
-function custom_truelysell_duration_options() {
-	return array(
-		0   => __( 'Not set', 'truelysell' ),
-		15  => __( '15 min', 'truelysell' ),
-		30  => __( '30 min', 'truelysell' ),
-		45  => __( '45 min', 'truelysell' ),
-		60  => __( '1 hour', 'truelysell' ),
-		90  => __( '1h 30m', 'truelysell' ),
-		120 => __( '2 hours', 'truelysell' ),
-		180 => __( '3 hours', 'truelysell' ),
-		240 => __( '4+ hours', 'truelysell' ),
-	);
-}
-
-function custom_truelysell_get_listing_duration_text( $listing_id ) {
-	$minutes = absint( get_post_meta( $listing_id, '_service_duration_minutes', true ) );
-	if ( ! $minutes ) {
-		return '';
-	}
-
-	$options = custom_truelysell_duration_options();
-	if ( isset( $options[ $minutes ] ) && 0 !== $minutes ) {
-		return $options[ $minutes ];
-	}
-
-	// A value that doesn't match a preset (e.g. saved by a filter/import) — format generically.
-	$hours = floor( $minutes / 60 );
-	$mins  = $minutes % 60;
-	if ( $hours && $mins ) {
-		return sprintf( '%dh %dm', $hours, $mins );
-	} elseif ( $hours ) {
-		return sprintf( '%dh', $hours );
-	}
-	return sprintf( '%d min', $mins );
-}
-
-add_action( 'add_meta_boxes', 'custom_truelysell_add_duration_metabox' );
-function custom_truelysell_add_duration_metabox() {
-	if ( ! current_user_can( 'administrator' ) ) {
-		return;
-	}
-
-	add_meta_box(
-		'custom_truelysell_service_duration',
-		__( 'Service Duration', 'truelysell' ),
-		'custom_truelysell_render_duration_metabox',
-		'listing',
-		'side',
-		'default'
-	);
-}
-
-function custom_truelysell_render_duration_metabox( $post ) {
-	wp_nonce_field( 'custom_truelysell_duration_save', 'custom_truelysell_duration_nonce' );
-
-	$current_minutes = absint( get_post_meta( $post->ID, '_service_duration_minutes', true ) );
-	?>
-	<p class="description"><?php esc_html_e( 'How long this service typically takes. Shown to customers on the listing page and service cards.', 'truelysell' ); ?></p>
-	<select name="custom_truelysell_service_duration_minutes" style="width:100%;">
-		<?php foreach ( custom_truelysell_duration_options() as $minutes => $label ) : ?>
-			<option value="<?php echo esc_attr( $minutes ); ?>" <?php selected( $current_minutes, $minutes ); ?>>
-				<?php echo esc_html( $label ); ?>
-			</option>
-		<?php endforeach; ?>
-	</select>
-	<?php
-}
-
-add_action( 'save_post_listing', 'custom_truelysell_save_duration_metabox' );
-function custom_truelysell_save_duration_metabox( $post_id ) {
-	if ( ! isset( $_POST['custom_truelysell_duration_nonce'] ) ||
-		! wp_verify_nonce( $_POST['custom_truelysell_duration_nonce'], 'custom_truelysell_duration_save' ) ) {
-		return;
-	}
-
-	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
-		return;
-	}
-
-	if ( ! current_user_can( 'administrator' ) ) {
-		return;
-	}
-
-	$minutes = isset( $_POST['custom_truelysell_service_duration_minutes'] ) ? absint( $_POST['custom_truelysell_service_duration_minutes'] ) : 0;
-
-	if ( $minutes ) {
-		update_post_meta( $post_id, '_service_duration_minutes', $minutes );
-	} else {
-		delete_post_meta( $post_id, '_service_duration_minutes' );
-	}
-}
-
-/**
- * Single listing page — show duration near the price/details area.
- */
-add_action( 'wp_footer', 'custom_truelysell_show_duration_on_single_listing' );
-function custom_truelysell_show_duration_on_single_listing() {
-	if ( ! is_singular( 'listing' ) ) {
-		return;
-	}
-
-	$duration_text = custom_truelysell_get_listing_duration_text( get_the_ID() );
-	if ( ! $duration_text ) {
-		return;
-	}
-	?>
-	<script type="text/javascript">
-	document.addEventListener('DOMContentLoaded', function () {
-		if (document.getElementById('truelysell-service-duration-badge')) return;
-
-		var priceEl = document.querySelector('.listing-detail-info, .listing-widget, .price-section, .card-body');
-		var anchor = document.querySelector('h2.mb-2, h1.mb-2, .breadcrumb-title') || document.body;
-		var badge = document.createElement('span');
-		badge.id = 'truelysell-service-duration-badge';
-		badge.className = 'badge bg-light text-dark border ms-2';
-		badge.innerHTML = '<i class="ti ti-clock me-1"></i>' + <?php echo wp_json_encode( $duration_text ); ?>;
-
-		var titleEl = document.querySelector('.detail-title h1, .detail-title h2, h1.mb-2, h2.mb-2');
-		if (titleEl) {
-			titleEl.appendChild(document.createTextNode(' '));
-			titleEl.appendChild(badge);
-		}
-	});
-	</script>
-	<?php
-}
-
-/**
- * Catalog cards (grid + list view) — piggyback on the existing provider-
- * count badge AJAX/JS (custom_truelysell_get_provider_counts /
- * custom_truelysell_render_provider_count_badges) so both pieces of info
- * arrive in the same batch request instead of adding a second one.
- */
-add_filter( 'custom_truelysell_provider_count_extra_data', 'custom_truelysell_add_duration_to_card_data', 10, 2 );
-function custom_truelysell_add_duration_to_card_data( $data, $post_id ) {
-	$data['duration'] = custom_truelysell_get_listing_duration_text( $post_id );
-	return $data;
 }
 
 
@@ -5620,10 +5710,6 @@ function custom_truelysell_profile_address_autocomplete() {
 				}
 			} );
 
-			// TEMPORARY DEBUG — remove once postal code fill is confirmed working.
-			console.log( 'Truelysell address_components:', place.address_components );
-			console.log( 'Truelysell parsed data:', data );
-
 			var countryField = document.getElementById( 'profile-country' );
 			var stateField   = document.getElementById( 'profile-state' );
 			var cityField    = document.getElementById( 'profile-city' );
@@ -5637,6 +5723,65 @@ function custom_truelysell_profile_address_autocomplete() {
 	}
 	</script>
 	<?php
+}
+
+/**
+ * "Maximum Travel Radius" (miles) — provider-only, one value per
+ * provider (not per-service). Together with their home address lat/lng,
+ * this is what determines whether they're eligible for a given customer
+ * booking (see custom_truelysell_find_nearest_eligible_provider()).
+ */
+add_action( 'wp_footer', 'custom_truelysell_provider_travel_radius_field' );
+function custom_truelysell_provider_travel_radius_field() {
+	$user_id = get_current_user_id();
+	if ( ! $user_id || ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return;
+	}
+
+	$profile_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'profile_page' ) : 0;
+	if ( ! $profile_page || absint( $profile_page ) !== absint( get_queried_object_id() ) ) {
+		return;
+	}
+
+	$saved_radius = get_user_meta( $user_id, 'profile-travel-radius-miles', true );
+	$saved_radius = $saved_radius ? absint( $saved_radius ) : 25; // sensible default, matches the spec's example
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var addressField = document.getElementById('profile-address');
+		if (!addressField || document.getElementById('profile-travel-radius-miles')) {
+			return;
+		}
+
+		var wrap = document.createElement('div');
+		wrap.className = 'mb-3';
+		wrap.innerHTML =
+			'<label for="profile-travel-radius-miles" class="form-label">Maximum Travel Radius (miles)</label>' +
+			'<input type="number" min="1" max="500" class="text-input form-control" name="profile-travel-radius-miles" id="profile-travel-radius-miles" value="<?php echo esc_attr( $saved_radius ); ?>" required>' +
+			'<p class="description">How far are you willing to travel for a job? Bookings outside this radius from your home address won\'t be assigned to you.</p>';
+
+		// Insert right after the Address field's own wrapping .mb-3.
+		var addressWrap = addressField.closest('.mb-3') || addressField.parentNode;
+		addressWrap.parentNode.insertBefore(wrap, addressWrap.nextSibling);
+	});
+	</script>
+	<?php
+}
+
+add_action( 'init', 'custom_truelysell_save_profile_travel_radius', 20 );
+function custom_truelysell_save_profile_travel_radius() {
+	if ( ! isset( $_POST['my-account-submission'] ) || '1' !== $_POST['my-account-submission'] ) {
+		return;
+	}
+
+	$user_id = get_current_user_id();
+	if ( ! $user_id || ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return;
+	}
+
+	if ( isset( $_POST['profile-travel-radius-miles'] ) && '' !== $_POST['profile-travel-radius-miles'] ) {
+		update_user_meta( $user_id, 'profile-travel-radius-miles', absint( $_POST['profile-travel-radius-miles'] ) );
+	}
 }
 
 /**
@@ -5747,7 +5892,6 @@ function custom_truelysell_render_provider_count_badges() {
 
 			Object.keys(items).forEach(function (url) {
 				var count = items[url].count;
-				var duration = items[url].duration;
 				var relatedCards = linkToCard[url] || [];
 
 				relatedCards.forEach(function (card) {
@@ -5761,13 +5905,6 @@ function custom_truelysell_render_provider_count_badges() {
 							? (count + (count === 1 ? ' provider available' : ' providers available'))
 							: 'No providers linked yet');
 						priceRow.insertBefore(badge, priceRow.firstChild);
-					}
-
-					if (duration && !card.querySelector('.truelysell-duration-badge')) {
-						var durationBadge = document.createElement('span');
-						durationBadge.className = 'truelysell-duration-badge badge bg-light text-dark border mb-2 me-1 d-inline-block';
-						durationBadge.innerHTML = '<i class="ti ti-clock me-1"></i>' + duration;
-						priceRow.insertBefore(durationBadge, priceRow.firstChild);
 					}
 				});
 			});
@@ -5800,6 +5937,68 @@ function custom_truelysell_get_provider_listing_available_days( $user_id, $listi
 	return custom_truelysell_all_week_days();
 }
 
+/**
+ * A provider's saved start/end time for one specific day of one specific
+ * listing. Stored separately from _available_days_by_listing (see below)
+ * so existing day-only data never changes shape — a provider who saved
+ * days before this feature existed keeps behaving exactly as before (no
+ * time restriction at all) until they explicitly set a range for a day.
+ */
+function custom_truelysell_get_provider_listing_hours_for_day( $user_id, $listing_id, $day_key ) {
+	$map = get_user_meta( $user_id, '_available_hours_by_listing', true );
+	if ( is_array( $map ) && isset( $map[ $listing_id ][ $day_key ]['start'], $map[ $listing_id ][ $day_key ]['end'] ) ) {
+		return array(
+			'start' => $map[ $listing_id ][ $day_key ]['start'],
+			'end'   => $map[ $listing_id ][ $day_key ]['end'],
+		);
+	}
+
+	// No range saved for this day yet — fully open, matching the existing
+	// "no days configured = available every day" fallback philosophy.
+	return array(
+		'start' => '00:00',
+		'end'   => '23:59',
+	);
+}
+
+/**
+ * { day_key: {start, end} } for every day currently in this provider's
+ * available_days for this listing — used to hand the customer's booking
+ * widget everything it needs in one AJAX response.
+ */
+function custom_truelysell_get_provider_listing_hours_map( $user_id, $listing_id ) {
+	$map = array();
+	foreach ( custom_truelysell_get_provider_listing_available_days( $user_id, $listing_id ) as $day_key ) {
+		$map[ $day_key ] = custom_truelysell_get_provider_listing_hours_for_day( $user_id, $listing_id, $day_key );
+	}
+	return $map;
+}
+
+/**
+ * <option> list in 30-minute increments, value in 24hr "HH:MM" (matching
+ * what's stored/compared everywhere else) but a friendly 12hr label. Used
+ * instead of <input type="time"> for the availability editor — native time
+ * inputs render with a locale-dependent AM/PM segment that's wider than
+ * expected and doesn't fit reliably in a multi-column card layout; a
+ * <select> has a fixed, predictable width regardless of browser/locale.
+ */
+function custom_truelysell_time_select_options( $selected_value ) {
+	$out = '';
+	for ( $h = 0; $h < 24; $h++ ) {
+		foreach ( array( '00', '30' ) as $m ) {
+			$value = sprintf( '%02d:%s', $h, $m );
+			$label = date( 'g:i A', strtotime( $value ) );
+			$out  .= sprintf(
+				'<option value="%1$s" %2$s>%3$s</option>',
+				esc_attr( $value ),
+				selected( $selected_value, $value, false ),
+				esc_html( $label )
+			);
+		}
+	}
+	return $out;
+}
+
 add_action( 'wp_ajax_custom_truelysell_save_listing_availability', 'custom_truelysell_ajax_save_listing_availability' );
 function custom_truelysell_ajax_save_listing_availability() {
 	check_ajax_referer( 'custom_truelysell_listing_availability', 'nonce' );
@@ -5825,7 +6024,30 @@ function custom_truelysell_ajax_save_listing_availability() {
 	$map[ $listing_id ] = $sanitized;
 	update_user_meta( $user_id, '_available_days_by_listing', $map );
 
-	wp_send_json_success( array( 'days' => $sanitized ) );
+	// Optional per-day start/end times, only for checked days — anything
+	// invalid or for an unchecked day is simply skipped (that day falls
+	// back to "no time restriction" via custom_truelysell_get_provider_listing_hours_for_day()).
+	$submitted_hours = array();
+	$raw_hours       = isset( $_POST['hours'] ) ? json_decode( wp_unslash( $_POST['hours'] ), true ) : null;
+	if ( is_array( $raw_hours ) ) {
+		foreach ( $raw_hours as $day_key => $range ) {
+			if ( ! in_array( $day_key, $sanitized, true ) || ! is_array( $range ) ) {
+				continue;
+			}
+			$start = isset( $range['start'] ) ? sanitize_text_field( $range['start'] ) : '';
+			$end   = isset( $range['end'] ) ? sanitize_text_field( $range['end'] ) : '';
+			if ( preg_match( '/^\d{2}:\d{2}$/', $start ) && preg_match( '/^\d{2}:\d{2}$/', $end ) && $start < $end ) {
+				$submitted_hours[ $day_key ] = array( 'start' => $start, 'end' => $end );
+			}
+		}
+	}
+
+	$hours_map                = get_user_meta( $user_id, '_available_hours_by_listing', true );
+	$hours_map                = is_array( $hours_map ) ? $hours_map : array();
+	$hours_map[ $listing_id ] = $submitted_hours;
+	update_user_meta( $user_id, '_available_hours_by_listing', $hours_map );
+
+	wp_send_json_success( array( 'days' => $sanitized, 'hours' => $submitted_hours ) );
 }
 
 /**
@@ -5849,11 +6071,32 @@ function custom_truelysell_listing_availability_save_script() {
 			var savedMsg = wrap.querySelector('.truelysell-availability-saved-msg');
 			if (!btn) return;
 
+			// Toggle each row's time inputs with its checkbox, without
+			// clearing the values already typed in (so unchecking and
+			// re-checking a day doesn't lose the saved-but-hidden range).
+			wrap.querySelectorAll('.truelysell-availability-day').forEach(function (cb) {
+				cb.addEventListener('change', function () {
+					var row = cb.closest('.truelysell-availability-day-row');
+					if (!row) return;
+					row.querySelectorAll('select').forEach(function (t) {
+						t.disabled = !cb.checked;
+					});
+				});
+			});
+
 			btn.addEventListener('click', function () {
 				var listingId = wrap.getAttribute('data-listing-id');
 				var days = [];
-				wrap.querySelectorAll('.truelysell-availability-day:checked').forEach(function (cb) {
+				var hours = {};
+				wrap.querySelectorAll('.truelysell-availability-day').forEach(function (cb) {
+					if (!cb.checked) return;
 					days.push(cb.value);
+					var row = cb.closest('.truelysell-availability-day-row');
+					var startEl = row ? row.querySelector('.truelysell-availability-start') : null;
+					var endEl = row ? row.querySelector('.truelysell-availability-end') : null;
+					if (startEl && endEl && startEl.value && endEl.value) {
+						hours[cb.value] = { start: startEl.value, end: endEl.value };
+					}
 				});
 
 				btn.disabled = true;
@@ -5865,6 +6108,7 @@ function custom_truelysell_listing_availability_save_script() {
 				formData.append('nonce', <?php echo wp_json_encode( wp_create_nonce( 'custom_truelysell_listing_availability' ) ); ?>);
 				formData.append('listing_id', listingId);
 				days.forEach(function (d) { formData.append('days[]', d); });
+				formData.append('hours', JSON.stringify(hours));
 
 				fetch('<?php echo esc_js( admin_url( 'admin-ajax.php' ) ); ?>', {
 					method: 'POST',

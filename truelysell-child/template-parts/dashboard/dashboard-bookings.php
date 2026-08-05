@@ -57,6 +57,7 @@ $status_colors = [
                     <thead>
                         <tr>
                             <th><?php esc_html_e( 'Service', 'truelysell' ); ?></th>
+                            <th><?php esc_html_e( 'Technician', 'truelysell' ); ?></th>
                             <th><?php esc_html_e( 'Booking Date', 'truelysell' ); ?></th>
                             <th><?php esc_html_e( 'Time', 'truelysell' ); ?></th>
                             <th><?php esc_html_e( 'Price', 'truelysell' ); ?></th>
@@ -67,6 +68,7 @@ $status_colors = [
                     <tbody>
                         <?php foreach ( $bookings as $booking ) : 
                             $listing = get_post( $booking->listing_id );
+                            $technician = ! empty( $booking->owner_id ) ? get_userdata( $booking->owner_id ) : false;
                             $booking_date = date( 'M d, Y', strtotime( $booking->date_start ) );
                             $start_time = date( 'H:i', strtotime( $booking->date_start ) );
                             $end_time = date( 'H:i', strtotime( $booking->date_end ) );
@@ -78,6 +80,7 @@ $status_colors = [
                                 <td>
                                     <strong><?php echo esc_html( $listing ? $listing->post_title : 'N/A' ); ?></strong>
                                 </td>
+                                <td><?php echo esc_html( $technician ? $technician->display_name : 'N/A' ); ?></td>
                                 <td><?php echo esc_html( $booking_date ); ?></td>
                                 <td><?php echo esc_html( $start_time . ' - ' . $end_time ); ?></td>
                                 <td><?php echo esc_html( $currency_symbol . number_format( $booking->price, 2 ) ); ?></td>

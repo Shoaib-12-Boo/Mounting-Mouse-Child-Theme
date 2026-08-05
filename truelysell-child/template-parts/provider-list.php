@@ -4,19 +4,23 @@
  *
  * Child theme override of the parent's template-parts/provider-list.php.
  * Fixes, on top of the original:
- * 1. The Location filter value was silently dropped by the JS submit
- *    handler (never added to the redirect URL at all).
- * 2. Multiple selected categories were joined into a single
+ * 1. Multiple selected categories were joined into a single
  *    comma-separated string and sent as one query param — WP_Query's
  *    tax_query treats that as one literal (non-matching) slug rather
  *    than multiple terms, so filtering broke as soon as more than one
  *    category was checked.
- * 3. Providers were found via matching listings' post_author — but this
+ * 2. Providers were found via matching listings' post_author — but this
  *    site's whole architecture has the public catalog authored by Admin
  *    only; real technicians/providers are LINKED to listings (see
  *    custom_truelysell_get_listing_linked_provider_ids() in functions.php),
  *    never the post_author. That made this page miss almost every real
  *    provider regardless of filters.
+ * 3. The keyword search only ever matched a technician's own display
+ *    name, never the service/listing title — searching "tv" found
+ *    nothing even though matching services existed. It now also matches
+ *    listing titles/content (and still matches technician names too).
+ * 4. Removed the Location filter entirely — providers don't fill in a
+ *    postal code, so it never matched anything.
  *
  * @package Truelysell
  */
@@ -76,22 +80,6 @@ if (isset($_GET['author_id'])) {
         </div>
     </div>
 
-                                    <div class="accordion border-bottom mb-3">
-										<div class="accordion-header" id="accordion-headingFive">
-											<div class="accordion-button p-0 mb-3" data-bs-toggle="collapse" data-bs-target="#accordion-collapseFive" aria-expanded="true" aria-controls="accordion-collapseFive" role="button">
-                                            <?php echo esc_html__('Location', 'truelysell'); ?>
-											</div>
-										</div>
-										<div id="accordion-collapseFive" class="accordion-collapse collapse show" aria-labelledby="accordion-headingFive">
-											<div class="mb-3">
-												<div class="position-relative">
-													<input type="text" name="location_search"  class="form-control" placeholder="Select Location" value="<?php echo esc_attr( sanitize_text_field( $_GET['location_search'] ?? '' ) ); ?>">
-													<span class="icon-addon"><i class="ti ti-map-pin"></i></span>
-												</div>
-											</div>
-										</div>
-									</div>
-
 
 <button type="submit" class="btn btn-dark w-100"><?php echo esc_html__('Search', 'truelysell'); ?></button>
 </form>
@@ -105,7 +93,6 @@ if (isset($_GET['author_id'])) {
   $search_keyword  = sanitize_text_field($_GET['search_keyword'] ?? '');
   $category_slugs  = isset( $_GET['provider_category'] ) ? (array) $_GET['provider_category'] : array();
   $category_slugs  = array_filter( array_map( 'sanitize_text_field', $category_slugs ) );
-  $location_search = sanitize_text_field($_GET['location_search'] ?? '');
 
   $listing_query_args = array(
       'post_type'      => 'listing',
@@ -124,58 +111,59 @@ if (isset($_GET['author_id'])) {
       );
   }
 
-  $matched_listing_ids = get_posts( $listing_query_args );
+  $category_listing_ids = get_posts( $listing_query_args );
 
   /*
    * The real technicians/providers offering these services are the ones
    * LINKED to each listing (custom_truelysell_get_listing_linked_provider_ids()),
    * not the listing's post_author — every listing in the public catalog
-   * is authored by Admin. Collect the union of linked providers across
-   * every matched listing.
+   * is authored by Admin. Collect the union of eligible linked providers
+   * for a given set of listing IDs.
    */
-  $provider_ids = array();
-  foreach ( $matched_listing_ids as $matched_listing_id ) {
-      if ( function_exists( 'custom_truelysell_get_listing_linked_provider_ids' ) ) {
-          foreach ( custom_truelysell_get_listing_linked_provider_ids( $matched_listing_id ) as $linked_id ) {
+  $get_eligible_linked_providers = function ( $listing_ids ) {
+      $ids = array();
+      foreach ( $listing_ids as $listing_id ) {
+          if ( ! function_exists( 'custom_truelysell_get_listing_linked_provider_ids' ) ) {
+              break;
+          }
+          foreach ( custom_truelysell_get_listing_linked_provider_ids( $listing_id ) as $linked_id ) {
               if ( function_exists( 'custom_truelysell_is_restricted_provider' ) && custom_truelysell_is_restricted_provider( $linked_id ) ) {
-                  $provider_ids[] = $linked_id;
+                  $ids[] = $linked_id;
               }
           }
       }
+      return $ids;
+  };
+
+  if ( empty( $search_keyword ) ) {
+      $provider_ids = $get_eligible_linked_providers( $category_listing_ids );
+  } else {
+      /*
+       * The keyword box searches for a SERVICE ("What are you looking for?"),
+       * so match it against listing titles/content too — not just a
+       * technician's own display name. A technician linked to a matching
+       * listing should show up even if their name has nothing to do with
+       * the keyword. Still allow a direct name match for anyone searching
+       * a technician by name.
+       */
+      $keyword_listing_ids  = get_posts( array_merge( $listing_query_args, array( 's' => $search_keyword ) ) );
+      $keyword_provider_ids = $get_eligible_linked_providers( $keyword_listing_ids );
+
+      $name_matched_user_ids = get_users( array(
+          'search'         => '*' . $search_keyword . '*',
+          'search_columns' => array( 'display_name' ),
+          'fields'         => 'ID',
+      ) );
+      $category_provider_ids = $get_eligible_linked_providers( $category_listing_ids );
+      $name_provider_ids     = array_intersect( $category_provider_ids, $name_matched_user_ids );
+
+      $provider_ids = array_merge( $keyword_provider_ids, $name_provider_ids );
   }
   $provider_ids = array_values( array_unique( $provider_ids ) );
 
   $args = array(
-    'include'        => ! empty( $provider_ids ) ? $provider_ids : array( 0 ),
-    'search'         => '*' . esc_attr($search_keyword) . '*',
-    'search_columns' => array('display_name'),
+    'include' => ! empty( $provider_ids ) ? $provider_ids : array( 0 ),
 );
-
-$meta_args = array();
-if (!empty($location_search)) {
-    $meta_args = array(
-        'meta_query' => array(
-            'relation' => 'OR',
-            array(
-                'key'     => 'profile-city',
-                'value'   => $location_search,
-                'compare' => 'LIKE',
-            ),
-            array(
-                'key'     => 'profile-address',
-                'value'   => $location_search,
-                'compare' => 'LIKE',
-            ),
-            array(
-                'key'     => 'profile-postalcode',
-                'value'   => $location_search,
-                'compare' => 'LIKE',
-            ),
-        ),
-    );
-}
-
-$args = array_merge($args, $meta_args);
 
 $users = new WP_User_Query($args);
 
@@ -258,7 +246,6 @@ get_footer();
             event.preventDefault();
             var params = new URLSearchParams();
             params.set('search_keyword', $('input[name="search_keyword"]').val());
-            params.set('location_search', $('input[name="location_search"]').val());
             $('input[name="provider_category[]"]:checked').each(function() {
                 params.append('provider_category[]', $(this).val());
             });
