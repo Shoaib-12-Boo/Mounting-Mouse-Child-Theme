@@ -2027,6 +2027,98 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 }
 
 /**
+ * The plugin's native "Chat Now" / "Enquiry Us" buttons on a single
+ * listing page (truelysell-core/templates/single-listing.php — plugin
+ * file, not overridden here) have two bugs, same root cause as everything
+ * else on this site: the plugin assumes the listing's post_author IS the
+ * provider, and that a signed-up customer's role is literally "guest".
+ * Neither holds here — every listing is admin-authored (real technicians
+ * are LINKED, see custom_truelysell_get_listing_linked_provider_ids()),
+ * and real sign-ups get role "customer", not "guest". Concretely:
+ * 1. The chat/enquiry recipient is hardcoded to $post->post_author
+ *    (Admin) — so any message a customer manages to send goes to Admin,
+ *    never the actual assigned technician.
+ * 2. The "Chat Now" button itself only renders for role "guest"
+ *    (`in_array($role, array('guest'))`) — a real, logged-in "customer"
+ *    account sees no button at all.
+ * Patched via JS injection rather than a full single-listing.php child-
+ * theme override (that template is large; duplicating all of it to change
+ * a few lines would make it much harder to pick up future plugin fixes).
+ */
+add_action( 'wp_footer', 'custom_truelysell_fix_chat_now_recipient_and_visibility' );
+function custom_truelysell_fix_chat_now_recipient_and_visibility() {
+	if ( ! is_singular( 'listing' ) ) {
+		return;
+	}
+
+	$listing_id = get_the_ID();
+
+	// Same "who's the real technician" resolution used elsewhere: prefer
+	// the explicitly assigned technician, else the first eligible linked
+	// provider, else fall back to post_author (Admin) as a last resort —
+	// never worse than the plugin's own original (always-Admin) behavior.
+	$recipient_id = absint( get_post_meta( $listing_id, '_assigned_technician_id', true ) );
+	if ( ! $recipient_id ) {
+		foreach ( custom_truelysell_get_listing_linked_provider_ids( $listing_id ) as $linked_id ) {
+			if ( custom_truelysell_is_restricted_provider( $linked_id ) ) {
+				$recipient_id = $linked_id;
+				break;
+			}
+		}
+	}
+	if ( ! $recipient_id ) {
+		$recipient_id = absint( get_post_field( 'post_author', $listing_id ) );
+	}
+
+	$current_user_id    = get_current_user_id();
+	$show_inject_button = $current_user_id && ! custom_truelysell_is_restricted_provider( $current_user_id );
+	?>
+	<script>
+	document.addEventListener('DOMContentLoaded', function () {
+		var recipientId = <?php echo wp_json_encode( (string) $recipient_id ); ?>;
+		var listingId    = <?php echo wp_json_encode( (string) $listing_id ); ?>;
+
+		// Fix #1: repoint any chat/enquiry trigger that DID render at the
+		// real technician instead of post_author (Admin).
+		document.querySelectorAll('.booking-message').forEach(function (el) {
+			el.setAttribute('data-recipient', recipientId);
+		});
+		var enquiryProviderField = document.querySelector('#contact-provider-form input[name="provider_id"]');
+		if (enquiryProviderField) enquiryProviderField.value = recipientId;
+
+		<?php if ( $show_inject_button ) : ?>
+		// Fix #2: the plugin's own template rendered NO button at all for
+		// this (real, logged-in, non-technician) account — inject one,
+		// matching the plugin's own markup/classes, next to the existing
+		// "Book Service" trigger so it doesn't depend on guessing at
+		// unrelated page structure.
+		if (!document.querySelector('.booking-message')) {
+			var bookBtn = null;
+			document.querySelectorAll('a, button').forEach(function (el) {
+				if (bookBtn) return;
+				var text = (el.textContent || '').trim().toLowerCase();
+				if (text.indexOf('book') !== -1 && el.closest('.col-sm-12, .row')) {
+					bookBtn = el;
+				}
+			});
+			if (bookBtn) {
+				var chatBtn = document.createElement('a');
+				chatBtn.setAttribute('data-bs-toggle', 'modal');
+				chatBtn.setAttribute('data-bs-target', '#booking_messages');
+				chatBtn.setAttribute('data-recipient', recipientId);
+				chatBtn.setAttribute('data-booking_id', 'booking_' + listingId);
+				chatBtn.className = 'btn btn-light btn-lg fs-14 px-1 w-100 booking-message rate-review popup-with-zoom-anim mt-2';
+				chatBtn.innerHTML = '<i class="ti ti-user me-2"></i><?php echo esc_js( __( 'Chat Now', 'truelysell' ) ); ?>';
+				bookBtn.insertAdjacentElement('afterend', chatBtn);
+			}
+		}
+		<?php endif; ?>
+	});
+	</script>
+	<?php
+}
+
+/**
  * Lets a provider remove an Admin-managed listing from their own "My
  * Services" — e.g. they no longer want to offer that service — WITHOUT
  * touching the shared listing post itself, which stays exactly as-is for
@@ -2897,6 +2989,51 @@ function custom_truelysell_handle_customer_booking_page() {
     return;
 }
 
+/**
+ * Multiple independent features on this site each want the Google Maps
+ * Places JS library (the customer booking widget, the provider profile
+ * address field, ...) — each used to print its OWN <script src=...maps...>
+ * tag with its own callback=. If more than one ever fires on the SAME
+ * page (e.g. a test account that's both a customer and, from earlier
+ * testing, also flagged as a technician), the library gets loaded twice,
+ * which is a well-documented source of silent breakage across EVERY
+ * Maps-dependent script on that page — not just the duplicate. Every
+ * feature now calls this to REGISTER its init function name instead of
+ * printing its own script tag; custom_truelysell_print_google_maps_bootstrap()
+ * (hooked very late in wp_footer, after everything has had a chance to
+ * register) prints exactly one <script src> for the whole page.
+ */
+function custom_truelysell_enqueue_google_maps_once( $api_key, $callback_fn_name ) {
+	global $custom_truelysell_maps_callbacks, $custom_truelysell_maps_api_key;
+	if ( ! $api_key || ! $callback_fn_name ) {
+		return;
+	}
+	if ( ! isset( $custom_truelysell_maps_callbacks ) ) {
+		$custom_truelysell_maps_callbacks = array();
+	}
+	$custom_truelysell_maps_api_key     = $api_key;
+	$custom_truelysell_maps_callbacks[] = $callback_fn_name;
+}
+
+add_action( 'wp_footer', 'custom_truelysell_print_google_maps_bootstrap', 999 );
+function custom_truelysell_print_google_maps_bootstrap() {
+	global $custom_truelysell_maps_callbacks, $custom_truelysell_maps_api_key;
+	if ( empty( $custom_truelysell_maps_callbacks ) || empty( $custom_truelysell_maps_api_key ) ) {
+		return;
+	}
+	$callbacks = array_unique( $custom_truelysell_maps_callbacks );
+	?>
+	<script>
+	function customTruelysellGoogleMapsReady() {
+		<?php foreach ( $callbacks as $fn ) : ?>
+		if ( typeof <?php echo esc_js( $fn ); ?> === 'function' ) { <?php echo esc_js( $fn ); ?>(); }
+		<?php endforeach; ?>
+	}
+	</script>
+	<script src="https://maps.googleapis.com/maps/api/js?key=<?php echo esc_attr( $custom_truelysell_maps_api_key ); ?>&libraries=places&loading=async&callback=customTruelysellGoogleMapsReady" async defer></script>
+	<?php
+}
+
 // ============================================================
 // INJECT BOOKING FORM on single listing page for logged-in customers
 // Hook into listing single page bottom area
@@ -3062,9 +3199,8 @@ function custom_truelysell_inject_customer_booking_modal() {
     if ( ! $customer_booking_maps_api_key && defined( 'TRUELYSELL_CHILD_GOOGLE_MAPS_API_KEY' ) ) {
         $customer_booking_maps_api_key = TRUELYSELL_CHILD_GOOGLE_MAPS_API_KEY;
     }
-    if ( $customer_booking_maps_api_key ) : ?>
-    <script src="https://maps.googleapis.com/maps/api/js?key=<?php echo esc_attr( $customer_booking_maps_api_key ); ?>&libraries=places&loading=async&callback=customTruelysellInitBookingAddressAutocomplete" async defer></script>
-    <?php endif; ?>
+    custom_truelysell_enqueue_google_maps_once( $customer_booking_maps_api_key, 'customTruelysellInitBookingAddressAutocomplete' );
+    ?>
     <script type="text/javascript">
     /*
      * Declared as plain global function declarations (not inside
@@ -3112,8 +3248,9 @@ function custom_truelysell_inject_customer_booking_modal() {
 
         var html = '<div class="fs-13 text-muted mb-2">Choose your technician:</div>';
         providers.forEach(function (p, idx) {
+            var hasDistance = (typeof p.distance_miles !== 'undefined' && p.distance_miles !== null);
             var badge = (showDistance && idx === 0) ? ' <span class="badge bg-success ms-1"><i class="ti ti-map-pin-filled me-1"></i>Nearest provider</span>' : '';
-            var distanceLine = showDistance ? ('<div class="fs-12 text-muted">about ' + p.distance_miles + ' miles away</div>') : '';
+            var distanceLine = hasDistance ? ('<div class="fs-12 text-muted">about ' + p.distance_miles + ' miles away</div>') : '';
             html += '<div class="card mb-2 truelysell-provider-card' + (idx === 0 ? ' border-primary' : '') + '" data-provider-id="' + p.id + '" style="cursor:pointer;">' +
                 '<div class="card-body d-flex align-items-center gap-2 py-2">' +
                     '<img src="' + p.avatar + '" alt="" style="width:36px;height:36px;border-radius:50%;object-fit:cover;">' +
@@ -3276,6 +3413,33 @@ function custom_truelysell_inject_customer_booking_modal() {
     function customTruelysellInitBookingAddressAutocomplete() {
         var input = document.getElementById('customer-booking-address');
         if (!input || !window.google || !google.maps || !google.maps.places) return;
+
+        /*
+         * place_changed only fires (and only then updates lat/lng) when a
+         * dropdown suggestion is actually picked — editing the text
+         * afterward without reselecting would otherwise leave the OLD
+         * lat/lng in place while the visible address shows something
+         * completely different, silently matching technicians against the
+         * wrong location. Clearing on every manual edit forces a fresh
+         * selection, and the existing submit check ("Please select your
+         * service address from the suggestions") already catches this.
+         */
+        input.addEventListener('input', function () {
+            document.getElementById('customer-booking-lat').value = '';
+            document.getElementById('customer-booking-lng').value = '';
+            document.getElementById('customer-selected-provider-id').value = '';
+            customTruelysellAssignedProviderDays = null;
+            customTruelysellAssignedProviderHours = null;
+            customTruelysellProvidersData = null;
+            var providersWrap = document.getElementById('service-providers-wrapper');
+            var providersList = document.getElementById('service-providers-list');
+            if (providersWrap) {
+                providersWrap.style.display = 'none';
+                providersWrap.setAttribute('data-out-of-area', '0');
+                providersWrap.setAttribute('data-out-of-hours', '0');
+            }
+            if (providersList) providersList.innerHTML = '';
+        });
 
         var autocomplete = new google.maps.places.Autocomplete(input, { types: ['address'] });
 
@@ -3567,13 +3731,14 @@ function custom_truelysell_find_nearest_eligible_provider( $listing_id, $custome
 
 	if ( empty( $configured ) ) {
 		/*
-		 * Nobody linked to this listing has finished their address/radius
-		 * setup, so we can't do real distance matching yet — but there ARE
+		 * Nobody linked to this listing has both address AND radius set,
+		 * so we can't do real eligibility filtering yet — but there ARE
 		 * real technicians linked to this service, so let the customer
 		 * pick one directly instead of leaving them with no named option
-		 * at all. No distance/hours-based "nearest" badge here since we
-		 * genuinely can't compute it; availability (days/hours) is still
-		 * included and still enforced at booking time.
+		 * at all. Still show a distance on each card whenever that
+		 * technician's home address IS geocoded (radius or no radius) —
+		 * no "nearest" badge though, since without every radius confirmed
+		 * we can't honestly claim who's truly closest-and-eligible.
 		 */
 		$manual_pick_providers = array();
 		foreach ( $provider_ids as $provider_id ) {
@@ -3584,14 +3749,32 @@ function custom_truelysell_find_nearest_eligible_provider( $listing_id, $custome
 			if ( ! $user_info ) {
 				continue;
 			}
-			$manual_pick_providers[] = array(
+			$entry = array(
 				'id'              => $provider_id,
 				'name'            => $user_info->display_name,
 				'avatar'          => get_avatar_url( $provider_id, array( 'size' => 60 ) ),
 				'available_days'  => custom_truelysell_get_provider_listing_available_days( $provider_id, $listing_id ),
 				'available_hours' => custom_truelysell_get_provider_listing_hours_map( $provider_id, $listing_id ),
 			);
+
+			$provider_lat = get_user_meta( $provider_id, 'profile-lat', true );
+			$provider_lng = get_user_meta( $provider_id, 'profile-lng', true );
+			if ( '' !== $provider_lat && '' !== $provider_lng ) {
+				$entry['distance_miles'] = round( custom_truelysell_haversine_miles( $customer_lat, $customer_lng, $provider_lat, $provider_lng ), 1 );
+			}
+
+			$manual_pick_providers[] = $entry;
 		}
+
+		// Known distances first (closest first), unknown-distance ones last.
+		usort( $manual_pick_providers, function ( $a, $b ) {
+			$a_has = isset( $a['distance_miles'] );
+			$b_has = isset( $b['distance_miles'] );
+			if ( $a_has && $b_has ) {
+				return $a['distance_miles'] <=> $b['distance_miles'];
+			}
+			return $a_has === $b_has ? 0 : ( $a_has ? -1 : 1 );
+		} );
 
 		return array(
 			'no_technicians_configured' => true,
@@ -5298,21 +5481,28 @@ function custom_truelysell_append_provider_received_reviews( $content ) {
  * #booking_messages modal, but only ever define that modal's actual HTML
  * on the separate Booking List page and the single listing page — never
  * on these dashboard pages. Clicking Chat there does nothing, since
- * Bootstrap has nothing to open. Rather than patch each page individually
- * (and risk creating a duplicate modal on pages that already have one
- * correctly), inject the modal via JS only when a "Chat" trigger is
- * present AND no #booking_messages modal already exists — safe on every
- * page, for both provider and customer accounts.
+ * Bootstrap has nothing to open. The modal HTML is injected via JS only
+ * when a "Chat" trigger is present AND no #booking_messages modal already
+ * exists, to avoid a visible duplicate — safe on every page.
  *
- * The submit handling is also self-contained rather than depending on the
- * plugin's own frontend.js binding: on at least one of these pages, that
- * binding wasn't intercepting the form (it fell back to a plain browser
- * GET submit), and separately, frontend.js stores the clicked booking's
- * recipient/booking-id via jQuery's .data() — which only writes to
- * jQuery's internal cache, never back to the actual HTML data-recipient
- * attribute — so plain JS reading that attribute would always see it
- * empty. Reading directly from the clicked "Chat" link's own attributes
- * avoids depending on jQuery's cache entirely.
+ * The submit handling, however, is attached UNCONDITIONALLY whenever a
+ * "Chat" trigger exists, regardless of whether the modal was just injected
+ * or already present natively — self-contained rather than depending on
+ * the plugin's own frontend.js binding. Confirmed reason this matters: the
+ * provider's own Booking List page (native plugin template
+ * truelysell-core/templates/dashboard-bookings.php) DOES already define
+ * its own #booking_messages modal, yet its "Chat" button still silently
+ * failed to deliver — frontend.js wasn't reliably intercepting that form's
+ * submit there either (having a modal present is not the same as having a
+ * working send handler for it). Separately, frontend.js also stores the
+ * clicked booking's recipient/booking-id via jQuery's .data() — which only
+ * writes to jQuery's internal cache, never back to the actual HTML
+ * data-recipient attribute — so plain JS reading that attribute would
+ * always see it empty. Reading directly from the clicked "Chat" link's own
+ * attributes avoids depending on jQuery's cache entirely. A capturing-phase
+ * listener (the trailing `true` on addEventListener) plus
+ * stopImmediatePropagation() ensures this handler wins over frontend.js's
+ * own (bubble-phase) binding regardless of script load order.
  */
 add_action( 'wp_footer', 'custom_truelysell_add_missing_chat_modal' );
 function custom_truelysell_add_missing_chat_modal() {
@@ -5322,35 +5512,51 @@ function custom_truelysell_add_missing_chat_modal() {
 	?>
 	<script type="text/javascript">
 	document.addEventListener('DOMContentLoaded', function () {
-		if ( ! document.querySelector('.booking-message') || document.getElementById('booking_messages') ) {
+		if ( ! document.querySelector('.booking-message') ) {
 			return;
 		}
 
-		var wrapper = document.createElement('div');
-		wrapper.innerHTML = <?php echo wp_json_encode(
-			'<div class="modal fade custom-modal" id="booking_messages" tabindex="-1" aria-labelledby="custom_truelysell_chat_modal_label" aria-hidden="true">'
-			. '<div class="modal-dialog modal-dialog-centered">'
-			. '<div class="modal-content">'
-			. '<div class="modal-header">'
-			. '<h5 class="modal-title" id="custom_truelysell_chat_modal_label">' . esc_html__( 'Send Message', 'truelysell_core' ) . '</h5>'
-			. '<button type="button" class="close-btn" data-bs-dismiss="modal" aria-label="Close"><i class="feather-x"></i></button>'
-			. '</div>'
-			. '<div class="modal-body">'
-			. '<form action="" id="send-message-from-widget" class="booking_message" data-booking_id="">'
-			. '<div class="form-group">'
-			. '<textarea data-recipient="" data-referral="" required cols="40" id="contact-message" class="form-control" name="message" rows="3" placeholder="' . esc_attr__( 'Your message', 'truelysell_core' ) . '"></textarea>'
-			. '</div>'
-			. '<button type="submit" class="btn btn-primary btn-block btn-lg msg-button">' . esc_html__( 'Send Message', 'truelysell_core' ) . '</button>'
-			. '<div class="notification closeable success mt-4"></div>'
-			. '</form>'
-			. '</div>'
-			. '</div>'
-			. '</div>'
-			. '</div>'
-		); ?>;
-		document.body.appendChild( wrapper.firstElementChild );
+		/*
+		 * Only inject the modal HTML if this page genuinely doesn't have
+		 * one — to avoid a visible duplicate. But the reliable submit
+		 * handling below must attach regardless of which page we're on:
+		 * at least one page (the provider's Booking List, native plugin
+		 * template truelysell-core/templates/dashboard-bookings.php) DOES
+		 * already have its own #booking_messages modal, yet still hits
+		 * the exact same "frontend.js isn't reliably intercepting this
+		 * form" bug described above — having the modal present doesn't
+		 * mean that page's send button actually works.
+		 */
+		if ( ! document.getElementById('booking_messages') ) {
+			var wrapper = document.createElement('div');
+			wrapper.innerHTML = <?php echo wp_json_encode(
+				'<div class="modal fade custom-modal" id="booking_messages" tabindex="-1" aria-labelledby="custom_truelysell_chat_modal_label" aria-hidden="true">'
+				. '<div class="modal-dialog modal-dialog-centered">'
+				. '<div class="modal-content">'
+				. '<div class="modal-header">'
+				. '<h5 class="modal-title" id="custom_truelysell_chat_modal_label">' . esc_html__( 'Send Message', 'truelysell_core' ) . '</h5>'
+				. '<button type="button" class="close-btn" data-bs-dismiss="modal" aria-label="Close"><i class="feather-x"></i></button>'
+				. '</div>'
+				. '<div class="modal-body">'
+				. '<form action="" id="send-message-from-widget" class="booking_message" data-booking_id="">'
+				. '<div class="form-group">'
+				. '<textarea data-recipient="" data-referral="" required cols="40" id="contact-message" class="form-control" name="message" rows="3" placeholder="' . esc_attr__( 'Your message', 'truelysell_core' ) . '"></textarea>'
+				. '</div>'
+				. '<button type="submit" class="btn btn-primary btn-block btn-lg msg-button">' . esc_html__( 'Send Message', 'truelysell_core' ) . '</button>'
+				. '<div class="notification closeable success mt-4"></div>'
+				. '</form>'
+				. '</div>'
+				. '</div>'
+				. '</div>'
+				. '</div>'
+			); ?>;
+			document.body.appendChild( wrapper.firstElementChild );
+		}
 
 		var form = document.getElementById('send-message-from-widget');
+		if ( ! form ) {
+			return;
+		}
 
 		document.addEventListener('click', function (e) {
 			var trigger = e.target.closest('.booking-message');
@@ -5636,12 +5842,18 @@ define( 'TRUELYSELL_CHILD_GOOGLE_MAPS_API_KEY', 'AIzaSyADyKpKfpym_L-R_9BxGMzwp02
 
 add_action( 'wp_footer', 'custom_truelysell_profile_address_autocomplete' );
 function custom_truelysell_profile_address_autocomplete() {
-	if ( ! is_user_logged_in() ) {
-		return;
-	}
-
-	$profile_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'profile_page' ) : 0;
-	if ( ! $profile_page || absint( $profile_page ) !== absint( get_queried_object_id() ) ) {
+	/*
+	 * Deliberately NOT gated to only the exact "profile_page" theme
+	 * option's page ID (that was the original gate here) — if a provider
+	 * ever reaches the address field via any other page/tab, this script
+	 * would silently never load, leaving a plain text input with no
+	 * geocoding at all, no matter how carefully they typed/reselected
+	 * their address. The JS itself already safely no-ops via
+	 * `if (!input || ...) return;` when #profile-address isn't present on
+	 * the page, so it's safe to just always output this for any real
+	 * provider account.
+	 */
+	if ( ! is_user_logged_in() || ! custom_truelysell_is_restricted_provider( get_current_user_id() ) ) {
 		return;
 	}
 
@@ -5653,8 +5865,8 @@ function custom_truelysell_profile_address_autocomplete() {
 	if ( ! $api_key ) {
 		return;
 	}
+	custom_truelysell_enqueue_google_maps_once( $api_key, 'customTruelysellInitProfileAddressAutocomplete' );
 	?>
-	<script src="https://maps.googleapis.com/maps/api/js?key=<?php echo esc_attr( $api_key ); ?>&libraries=places&loading=async&callback=customTruelysellInitProfileAddressAutocomplete" async defer></script>
 	<script>
 	function customTruelysellInitProfileAddressAutocomplete() {
 		var input = document.getElementById('profile-address');
@@ -5677,6 +5889,22 @@ function custom_truelysell_profile_address_autocomplete() {
 
 		var latField = ensureHiddenField( 'profile-lat', 'profile-lat' );
 		var lngField = ensureHiddenField( 'profile-lng', 'profile-lng' );
+
+		/*
+		 * Google's place_changed only fires (and only then updates
+		 * lat/lng) when a dropdown suggestion is actually picked — typing
+		 * or editing the visible address text afterward does NOT re-fire
+		 * it, so the OLD lat/lng would otherwise silently keep pointing at
+		 * a totally different location than the text now shown. That
+		 * mismatch is exactly how a technician could end up "eligible" for
+		 * bookings hundreds of miles from their real, current address.
+		 * Clearing on every manual edit forces a fresh selection before
+		 * this profile can be saved with a location again.
+		 */
+		input.addEventListener( 'input', function () {
+			latField.value = '';
+			lngField.value = '';
+		} );
 
 		var autocomplete = new google.maps.places.Autocomplete( input, { types: [ 'address' ] } );
 
@@ -5738,11 +5966,14 @@ function custom_truelysell_provider_travel_radius_field() {
 		return;
 	}
 
-	$profile_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'profile_page' ) : 0;
-	if ( ! $profile_page || absint( $profile_page ) !== absint( get_queried_object_id() ) ) {
-		return;
-	}
-
+	/*
+	 * Same reasoning as custom_truelysell_profile_address_autocomplete()
+	 * above: no longer gated to the exact "profile_page" option's page ID
+	 * — the JS itself already safely no-ops when #profile-address isn't
+	 * on the page (line ~5913 below), so this can just always run for any
+	 * real provider account instead of silently never firing if they
+	 * reach their profile via a different page/tab than that one option.
+	 */
 	$saved_radius = get_user_meta( $user_id, 'profile-travel-radius-miles', true );
 	$saved_radius = $saved_radius ? absint( $saved_radius ) : 25; // sensible default, matches the spec's example
 	?>
