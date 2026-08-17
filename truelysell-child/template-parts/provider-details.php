@@ -381,10 +381,10 @@ if ($posts) { ?>
 															<div class="card-body">
 																<div class="img-sec w-100 mb-3">
 																	
-<a href="<?php the_permalink(); ?>">
-	
+<a href="<?php echo esc_url( add_query_arg( 'author_id', $provider_id, get_permalink() ) ); ?>">
 
- <?php 
+
+ <?php
 						
 						if(has_post_thumbnail($post->ID)){ 
 							echo get_the_post_thumbnail($post->ID, 'truelysell-listing-grid-small', array('class' => 'img-fluid rounded-top w-100'));
@@ -412,7 +412,7 @@ if ($posts) { ?>
 </a>																</div>
 																<div>
  <h5 class="mb-2 text-truncate">
- <a href="<?php the_permalink(); ?>"><?php the_title(); ?></a></h5>
+ <a href="<?php echo esc_url( add_query_arg( 'author_id', $provider_id, get_permalink() ) ); ?>"><?php the_title(); ?></a></h5>
  <div class="d-flex justify-content-between align-items-center mb-2">
  
  

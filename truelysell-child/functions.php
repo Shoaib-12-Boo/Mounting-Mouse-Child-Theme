@@ -669,6 +669,32 @@ function custom_truelysell_hide_related_services_section() {
 }
 
 /**
+ * "Mark As Paid" (truelysell-core/templates/booking/content-booking.php,
+ * provider's own Booking List rows only) exists for the plugin's native
+ * manual-invoicing workflow — a booking starts "confirmed, awaiting
+ * payment" and a provider marks it paid once they've collected it
+ * themselves. On this site every booking is instead created already
+ * status "paid" the moment the customer's 20% deposit clears (see
+ * custom_truelysell_finalize_deposit_booking()) — there's no "awaiting
+ * payment" state for this button to ever act on. Clicking it hits the
+ * plugin's own "don't process a status change to the same status" guard
+ * (Truelysell_Core_Bookings_Calendar::set_booking_status(), the
+ * `if ($booking_data['status'] == $status) return;` check) and silently
+ * no-ops — technically correct, but looks like a broken button. Hiding it
+ * site-wide since the class only ever appears on this one row template.
+ */
+add_action( 'wp_head', 'custom_truelysell_hide_mark_as_paid_button' );
+function custom_truelysell_hide_mark_as_paid_button() {
+	?>
+	<style>
+		.mark-as-paid {
+			display: none !important;
+		}
+	</style>
+	<?php
+}
+
+/**
  * The decorative "breadcrumb-bg-01.png" / "breadcrumb-bg-02.png" images in
  * the hero/breadcrumb section aren't in any editable theme template — hide
  * them site-wide via CSS instead.
@@ -1278,6 +1304,24 @@ function custom_truelysell_registration_handler( $user_id ) {
 		}
 	}
 
+	$ghl_user_data = get_userdata( $user_id );
+	$ghl_phone     = get_user_meta( $user_id, 'phone', true );
+	if ( ! $ghl_phone ) {
+		$ghl_phone = get_user_meta( $user_id, 'phone_number', true );
+	}
+	custom_truelysell_send_ghl_webhook(
+		$is_technician ? TRUELYSELL_CHILD_GHL_WEBHOOK_TECHNICIAN_URL : TRUELYSELL_CHILD_GHL_WEBHOOK_CUSTOMER_URL,
+		$is_technician ? 'new_technician' : 'new_customer',
+		array(
+			'user_id'    => $user_id,
+			'first_name' => $ghl_user_data ? $ghl_user_data->first_name : '',
+			'last_name'  => $ghl_user_data ? $ghl_user_data->last_name : '',
+			'name'       => $ghl_user_data ? $ghl_user_data->display_name : '',
+			'email'      => $ghl_user_data ? $ghl_user_data->user_email : '',
+			'phone'      => $ghl_phone,
+		)
+	);
+
 	/**
 	 * IMPORTANT FIX: Agar form submit karte waqt browser mein pehle se
 	 * koi dusra user (masalan Admin) login hai, to WordPress apne aap
@@ -1805,20 +1849,20 @@ function custom_truelysell_reassign_bookings_to_technician() {
 }
 
 /**
- * The public single listing page's "Service Provider" box
- * (truelysell-core/templates/single-listing.php) is hardcoded to
- * `$author_id = $post->post_author` — always the listing's original
- * author (Admin, for a shared catalog listing), with no hook to override
- * it. Show a real linked technician here instead, purely for general
- * info (name/photo/rating) — NOT a picker. Per the service-area-matching
- * spec, which technician actually gets assigned to a real booking is
- * decided at booking time by distance from the customer's service
- * address to each technician's private home address (see
- * custom_truelysell_find_nearest_eligible_provider()), never by customer
- * choice or by whichever technician happens to be shown on this page.
+ * The single listing page's "Service Provider" sidebar box always showed
+ * ONE specific technician's name/photo/contact info — but which
+ * technician actually gets assigned only gets decided at booking time, by
+ * distance from whatever address the customer enters (see
+ * custom_truelysell_find_nearest_eligible_provider()). Showing one fixed
+ * person here was misleading (implies "this is your technician" when it
+ * might not be) and was also the source of a confusing duplicate-context
+ * issue when a customer arrived via that same technician's own profile
+ * page. Replaced entirely with a neutral "How It Works" explainer that
+ * doesn't reference any specific person — accurate regardless of who
+ * ends up assigned, and consistent no matter how the customer got here.
  */
-add_action( 'wp_footer', 'custom_truelysell_show_assigned_technician_as_provider' );
-function custom_truelysell_show_assigned_technician_as_provider() {
+add_action( 'wp_footer', 'custom_truelysell_replace_provider_box_with_how_it_works' );
+function custom_truelysell_replace_provider_box_with_how_it_works() {
 	if ( ! is_singular( 'listing' ) ) {
 		return;
 	}
@@ -1828,35 +1872,21 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 
 	if ( empty( $provider_ids ) ) {
 		/*
-		 * No provider linked at all — the native "Service Provider" box
-		 * (and, on some listings, the Book Now button with it) can end up
-		 * rendering blank/broken in this state instead of showing a clear
-		 * message. Replace whatever's in that sidebar area with an
-		 * explicit "not available yet" notice instead of leaving a
-		 * confusing gap.
+		 * Genuinely nobody to fulfill this service — say so plainly and
+		 * hide the booking button, rather than show "How It Works" copy
+		 * that would wrongly imply booking is possible.
 		 */
 		?>
 		<script type="text/javascript">
-		document.addEventListener('DOMContentLoaded', function() {
+		document.addEventListener('DOMContentLoaded', function () {
 			var box = document.querySelector('.provider-info');
 			var notice = '<div class="alert alert-warning mb-0">' +
 				'<i class="ti ti-alert-triangle me-1"></i>' +
 				<?php echo wp_json_encode( esc_html__( 'No provider is currently available for this service. Please check back later or contact us directly.', 'truelysell' ) ); ?> +
 				'</div>';
-
 			if (box) {
 				box.innerHTML = notice;
-			} else {
-				var sidebar = document.querySelector('.listing-sidebar, .col-lg-4, .col-xl-4');
-				if (sidebar) {
-					var wrap = document.createElement('div');
-					wrap.innerHTML = notice;
-					sidebar.appendChild(wrap.firstChild);
-				}
 			}
-
-			// A booking button with no real provider behind it would just
-			// error out anyway — hide it so nothing looks clickable.
 			document.querySelectorAll('[data-bs-target="#user-account"]').forEach(function (btn) {
 				var text = (btn.textContent || '').trim().toLowerCase();
 				if (text.indexOf('book') !== -1) {
@@ -1868,159 +1898,50 @@ function custom_truelysell_show_assigned_technician_as_provider() {
 		<?php
 		return;
 	}
-
-	$provider_details_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'provider_details_page' ) : 0;
-	$show_email             = ! ( function_exists( 'truelysell_fl_framework_getoptions' ) && truelysell_fl_framework_getoptions( 'disable_email' ) );
-	$default_provider_id    = absint( get_post_meta( $listing_id, '_assigned_technician_id', true ) );
-	if ( ! $default_provider_id || ! in_array( $default_provider_id, $provider_ids, true ) ) {
-		$default_provider_id = $provider_ids[0];
-	}
-
-	$providers_data = array();
-	foreach ( $provider_ids as $provider_id ) {
-		$technician = get_userdata( $provider_id );
-		if ( ! $technician ) {
-			continue;
-		}
-
-		$providers_data[] = array(
-			'id'            => $provider_id,
-			'name'          => $technician->display_name,
-			'avatar'        => get_avatar( $provider_id, 64, '', '', array( 'class' => 'img-fluid rounded-circle' ) ),
-			'profile_url'   => $provider_details_page ? add_query_arg( 'author_id', $provider_id, get_permalink( $provider_details_page ) ) : '',
-			'member_since'  => date( 'd M Y', strtotime( $technician->user_registered ) ),
-			'email'         => $show_email ? $technician->user_email : '',
-			'listing_count' => count( custom_truelysell_get_provider_real_listing_ids( $provider_id ) ),
-		);
-	}
-
-	if ( empty( $providers_data ) ) {
-		return;
-	}
 	?>
 	<script type="text/javascript">
-	document.addEventListener('DOMContentLoaded', function() {
-		var box = document.querySelector('.provider-info');
-
-		if (!box) {
-			/*
-			 * The native "Service Provider" box (truelysell-core's own
-			 * single-listing template) doesn't render at all for some
-			 * listings — seen on ones where post_author data ends up
-			 * unusable for that template's own logic. Rather than leave
-			 * the sidebar blank with no way to see who's offering the
-			 * service, build a minimal equivalent box from scratch so
-			 * the rest of this script (which expects this structure) has
-			 * something to populate.
-			 */
-			var sidebar = document.querySelector('.col-xl-4, .col-lg-4, .listing-sidebar');
-			if (!sidebar) {
-				return;
-			}
-
-			var wrap = document.createElement('div');
-			wrap.innerHTML =
-				'<div class="card border-0 provider-info truelysell-injected-provider-info">' +
-					'<div class="card-body">' +
-						'<h6 class="mb-3">Service Provider</h6>' +
-						'<div class="d-flex align-items-center mb-3">' +
-							'<span class="avatar avatar-lg me-2"><img src="" alt="" class="rounded-circle" style="width:48px;height:48px;object-fit:cover;"></span>' +
-							'<h5 class="mb-0"><a href="javascript:void(0);"></a></h5>' +
-						'</div>' +
-						'<div class="d-flex justify-content-between mb-2"><h6 class="mb-0 fs-13">Member Since</h6><p class="mb-0 fs-13"></p></div>' +
-						'<div class="d-flex justify-content-between mb-2"><h6 class="mb-0 fs-13">Email</h6><p class="mb-0 fs-13"></p></div>' +
-						'<div class="d-flex justify-content-between mb-0"><h6 class="mb-0 fs-13">No of Listings</h6><p class="mb-0 fs-13"></p></div>' +
-					'</div>' +
-				'</div>';
-			box = wrap.firstChild;
-			sidebar.appendChild(box);
+	document.addEventListener('DOMContentLoaded', function () {
+		var providerInfo = document.querySelector('.provider-info');
+		var card         = providerInfo ? providerInfo.closest('.card') : null;
+		var cardBody     = card ? card.querySelector('.card-body') : null;
+		if (!cardBody) {
+			return;
 		}
 
-		/*
-		 * Same underlying issue can also wipe out the native "Book Now"
-		 * button on these listings — the custom booking modal (see
-		 * custom_truelysell_inject_customer_booking_modal()) only ever
-		 * hijacks buttons that already exist; if none exist, add one
-		 * with the exact attributes/markup that hijacking logic looks
-		 * for, so it gets picked up automatically once it runs.
-		 */
-		var hasBookButton = false;
-		document.querySelectorAll('[data-bs-target="#user-account"]').forEach(function (el) {
-			if ((el.textContent || '').trim().toLowerCase().indexOf('book') !== -1) {
-				hasBookButton = true;
-			}
-		});
-
-		if (!hasBookButton) {
-			var bookWrap = document.createElement('div');
-			bookWrap.className = 'mt-3';
-			bookWrap.innerHTML =
-				'<input type="hidden" name="post_id" value="<?php echo esc_js( (string) $listing_id ); ?>">' +
-				'<a href="javascript:void(0);" data-bs-target="#user-account" class="btn btn-primary w-100">Book Now</a>';
-			box.querySelector('.card-body').appendChild(bookWrap);
-		}
-
-		var providers = <?php echo wp_json_encode( $providers_data ); ?>;
-
-		function replaceValueFor(labelText, newValue) {
-			var rows = document.querySelectorAll('.card-body .d-flex.justify-content-between');
-			for (var i = 0; i < rows.length; i++) {
-				var label = rows[i].querySelector('h6');
-				if (label && label.textContent.trim().indexOf(labelText) !== -1) {
-					var value = rows[i].querySelector('p');
-					if (value) {
-						value.textContent = newValue;
-					}
-					break;
-				}
-			}
-		}
-
-		function applyProvider(provider) {
-			var avatarImg = box.querySelector('.avatar img');
-			if (avatarImg) {
-				var wrapper = document.createElement('div');
-				wrapper.innerHTML = provider.avatar;
-				var newAvatar = wrapper.querySelector('img');
-				if (newAvatar) {
-					avatarImg.replaceWith(newAvatar);
-				}
-			}
-
-			var nameLink = box.querySelector('h5 a');
-			if (nameLink) {
-				nameLink.textContent = provider.name;
-				if (provider.profile_url) {
-					nameLink.setAttribute('href', provider.profile_url);
-				}
-			}
-
-			replaceValueFor('Member Since', provider.member_since);
-			if (provider.email) {
-				replaceValueFor('Email', provider.email);
-			}
-			replaceValueFor('No of Listings', provider.listing_count);
-		}
-
-		/*
-		 * Just shows one representative technician for general info
-		 * (name/photo/rating) — which technician actually gets assigned
-		 * to a real booking is decided at booking time by distance from
-		 * the customer's service address (see
-		 * custom_truelysell_find_nearest_eligible_provider()), not by
-		 * whichever one happens to be displayed here. So this is
-		 * intentionally NOT a picker anymore — no dropdown, no carried-
-		 * over selection into the booking modal.
-		 */
-		function findProvider(id) {
-			for (var i = 0; i < providers.length; i++) {
-				if (String(providers[i].id) === String(id)) return providers[i];
-			}
-			return providers[0];
-		}
-
-		var defaultId = <?php echo wp_json_encode( (string) $default_provider_id ); ?>;
-		applyProvider(findProvider(defaultId));
+		cardBody.innerHTML =
+			'<h4 class="mb-3"><?php echo esc_js( __( 'How It Works', 'truelysell' ) ); ?></h4>' +
+			'<div class="d-flex align-items-start mb-3">' +
+				'<span class="avatar avatar-sm bg-primary-transparent text-primary rounded-circle me-2 flex-shrink-0 fw-bold d-flex align-items-center justify-content-center" style="line-height:1;">1</span>' +
+				'<div>' +
+					'<h6 class="fs-14 fw-medium mb-1"><?php echo esc_js( __( 'Get Matched', 'truelysell' ) ); ?></h6>' +
+					'<p class="fs-13 text-muted mb-0"><?php echo esc_js( __( 'We connect you with the nearest available technician in your area.', 'truelysell' ) ); ?></p>' +
+				'</div>' +
+			'</div>' +
+			'<div class="d-flex align-items-start mb-3">' +
+				'<span class="avatar avatar-sm bg-primary-transparent text-primary rounded-circle me-2 flex-shrink-0 fw-bold d-flex align-items-center justify-content-center" style="line-height:1;">2</span>' +
+				'<div>' +
+					'<h6 class="fs-14 fw-medium mb-1"><?php echo esc_js( __( 'Book', 'truelysell' ) ); ?></h6>' +
+					'<p class="fs-13 text-muted mb-0"><?php echo esc_js( __( 'Fill in your details and preferred date/time.', 'truelysell' ) ); ?></p>' +
+				'</div>' +
+			'</div>' +
+			'<div class="d-flex align-items-start mb-3">' +
+				'<span class="avatar avatar-sm bg-primary-transparent text-primary rounded-circle me-2 flex-shrink-0 fw-bold d-flex align-items-center justify-content-center" style="line-height:1;">3</span>' +
+				'<div>' +
+					'<h6 class="fs-14 fw-medium mb-1"><?php echo esc_js( __( 'Pay Deposit', 'truelysell' ) ); ?></h6>' +
+					'<p class="fs-13 text-muted mb-0"><?php echo esc_js( __( 'Secure your slot with a 20% deposit.', 'truelysell' ) ); ?></p>' +
+				'</div>' +
+			'</div>' +
+			'<div class="d-flex align-items-start mb-3">' +
+				'<span class="avatar avatar-sm bg-primary-transparent text-primary rounded-circle me-2 flex-shrink-0 fw-bold d-flex align-items-center justify-content-center" style="line-height:1;">4</span>' +
+				'<div>' +
+					'<h6 class="fs-14 fw-medium mb-1"><?php echo esc_js( __( 'Confirm &amp; Complete', 'truelysell' ) ); ?></h6>' +
+					'<p class="fs-13 text-muted mb-0"><?php echo esc_js( __( 'Your technician confirms the time and completes the job.', 'truelysell' ) ); ?></p>' +
+				'</div>' +
+			'</div>' +
+			'<div class="d-flex flex-wrap gap-2 pt-3 border-top">' +
+				'<span class="badge bg-light text-dark border fw-medium"><i class="ti ti-shield-check me-1"></i><?php echo esc_js( __( 'Licensed &amp; Insured', 'truelysell' ) ); ?></span>' +
+				'<span class="badge bg-light text-dark border fw-medium"><i class="ti ti-user-check me-1"></i><?php echo esc_js( __( 'Background-Checked', 'truelysell' ) ); ?></span>' +
+			'</div>';
 	});
 	</script>
 	<?php
@@ -3215,6 +3136,26 @@ function custom_truelysell_inject_customer_booking_modal() {
     var customTruelysellAssignedProviderHours = null;
     var customTruelysellProvidersData = null;
 
+    /*
+     * If the customer arrived on this listing page via a specific
+     * technician's own profile page (provider-details.php's service links
+     * carry ?author_id=), they've effectively already chosen — default to
+     * that technician instead of silently overriding their choice with
+     * "nearest." Falls back to the first (nearest, or first-listed in the
+     * manual-pick case) provider when there's no such context, or when
+     * that specific technician isn't actually in today's eligible list
+     * (e.g. out of their travel radius for this address).
+     */
+    function customTruelysellPickDefaultProvider(providers) {
+        var preferredId = new URLSearchParams(window.location.search).get('author_id');
+        if (preferredId) {
+            for (var i = 0; i < providers.length; i++) {
+                if (String(providers[i].id) === String(preferredId)) return providers[i];
+            }
+        }
+        return providers[0];
+    }
+
     function customTruelysellSelectProvider(providerId) {
         var list = document.getElementById('service-providers-list');
         if (!list || !customTruelysellProvidersData) return;
@@ -3246,19 +3187,25 @@ function custom_truelysell_inject_customer_booking_modal() {
         var list = document.getElementById('service-providers-list');
         if (!list) return;
 
+        var selected = customTruelysellPickDefaultProvider(providers);
+
         var html = '<div class="fs-13 text-muted mb-2">Choose your technician:</div>';
         providers.forEach(function (p, idx) {
+            var isSelected = String(p.id) === String(selected.id);
             var hasDistance = (typeof p.distance_miles !== 'undefined' && p.distance_miles !== null);
+            // "Nearest provider" always reflects true sorted order (idx === 0),
+            // independent of which card is pre-selected — a referred
+            // technician who isn't actually nearest shouldn't be mislabeled.
             var badge = (showDistance && idx === 0) ? ' <span class="badge bg-success ms-1"><i class="ti ti-map-pin-filled me-1"></i>Nearest provider</span>' : '';
             var distanceLine = hasDistance ? ('<div class="fs-12 text-muted">about ' + p.distance_miles + ' miles away</div>') : '';
-            html += '<div class="card mb-2 truelysell-provider-card' + (idx === 0 ? ' border-primary' : '') + '" data-provider-id="' + p.id + '" style="cursor:pointer;">' +
+            html += '<div class="card mb-2 truelysell-provider-card' + (isSelected ? ' border-primary' : '') + '" data-provider-id="' + p.id + '" style="cursor:pointer;">' +
                 '<div class="card-body d-flex align-items-center gap-2 py-2">' +
                     '<img src="' + p.avatar + '" alt="" style="width:36px;height:36px;border-radius:50%;object-fit:cover;">' +
                     '<div class="flex-grow-1">' +
                         '<div><strong>' + p.name + '</strong>' + badge + '</div>' +
                         distanceLine +
                     '</div>' +
-                    '<i class="ti ti-circle-check-filled text-primary truelysell-provider-check" style="' + (idx === 0 ? '' : 'visibility:hidden;') + '"></i>' +
+                    '<i class="ti ti-circle-check-filled text-primary truelysell-provider-check" style="' + (isSelected ? '' : 'visibility:hidden;') + '"></i>' +
                 '</div>' +
             '</div>';
         });
@@ -3305,10 +3252,10 @@ function custom_truelysell_inject_customer_booking_modal() {
 
             if (payload.assigned && payload.providers && payload.providers.length) {
                 customTruelysellProvidersData = payload.providers;
-                var firstProvider = payload.providers[0];
-                document.getElementById('customer-selected-provider-id').value = firstProvider.id;
-                customTruelysellAssignedProviderDays = firstProvider.available_days || null;
-                customTruelysellAssignedProviderHours = firstProvider.available_hours || null;
+                var defaultProvider = customTruelysellPickDefaultProvider(payload.providers);
+                document.getElementById('customer-selected-provider-id').value = defaultProvider.id;
+                customTruelysellAssignedProviderDays = defaultProvider.available_days || null;
+                customTruelysellAssignedProviderHours = defaultProvider.available_hours || null;
                 wrap.setAttribute('data-out-of-area', '0');
                 customTruelysellRenderProviderCards(payload.providers, true);
                 customTruelysellCheckPreferredDateAvailability();
@@ -3330,10 +3277,10 @@ function custom_truelysell_inject_customer_booking_modal() {
                 // but there ARE real technicians linked to it, so let the
                 // customer pick one directly instead of a vague message.
                 customTruelysellProvidersData = payload.providers;
-                var firstManualProvider = payload.providers[0];
-                document.getElementById('customer-selected-provider-id').value = firstManualProvider.id;
-                customTruelysellAssignedProviderDays = firstManualProvider.available_days || null;
-                customTruelysellAssignedProviderHours = firstManualProvider.available_hours || null;
+                var defaultManualProvider = customTruelysellPickDefaultProvider(payload.providers);
+                document.getElementById('customer-selected-provider-id').value = defaultManualProvider.id;
+                customTruelysellAssignedProviderDays = defaultManualProvider.available_days || null;
+                customTruelysellAssignedProviderHours = defaultManualProvider.available_hours || null;
                 wrap.setAttribute('data-out-of-area', '0');
                 customTruelysellRenderProviderCards(payload.providers, false);
                 customTruelysellCheckPreferredDateAvailability();
@@ -3776,6 +3723,10 @@ function custom_truelysell_find_nearest_eligible_provider( $listing_id, $custome
 			return $a_has === $b_has ? 0 : ( $a_has ? -1 : 1 );
 		} );
 
+		// Same cap as the fully-eligible list below — keep this a real,
+		// pickable list rather than showing every linked technician.
+		$manual_pick_providers = array_slice( $manual_pick_providers, 0, apply_filters( 'truelysell_max_shown_providers', 5 ) );
+
 		return array(
 			'no_technicians_configured' => true,
 			'manual_pick_providers'     => $manual_pick_providers,
@@ -3811,6 +3762,16 @@ function custom_truelysell_find_nearest_eligible_provider( $listing_id, $custome
 	if ( empty( $providers ) ) {
 		return array( 'out_of_area' => true );
 	}
+
+	/*
+	 * Cap how many technicians the customer sees, even though more may be
+	 * genuinely eligible — this stays a real, pickable list as the
+	 * business grows to dozens of technicians in one area, instead of an
+	 * overwhelming wall of cards. Already sorted nearest-first, so this
+	 * simply keeps the closest N and drops the rest for THIS customer's
+	 * view; it has no effect on actual eligibility/assignment logic.
+	 */
+	$providers = array_slice( $providers, 0, apply_filters( 'truelysell_max_shown_providers', 5 ) );
 
 	return array( 'providers' => $providers );
 }
@@ -4257,6 +4218,28 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
     $order->save_meta_data();
 
     custom_truelysell_register_deposit_commission( $order, $owner_id, $booking_id, $listing_id, $deposit_amount );
+
+    $ghl_owner_info = get_userdata( $owner_id );
+    custom_truelysell_send_ghl_webhook(
+        TRUELYSELL_CHILD_GHL_WEBHOOK_BOOKING_URL,
+        'new_booking',
+        array(
+            'booking_id'       => $booking_id,
+            'order_id'         => $order_id,
+            'listing_id'       => $listing_id,
+            'service_name'     => get_the_title( $listing_id ),
+            'customer_name'    => trim( $first_name . ' ' . $last_name ),
+            'customer_email'   => $email,
+            'customer_phone'   => $phone,
+            'customer_address' => $customer_address,
+            'technician_name'  => $ghl_owner_info ? $ghl_owner_info->display_name : '',
+            'technician_email' => $ghl_owner_info ? $ghl_owner_info->user_email : '',
+            'preferred_date'   => $preferred_date,
+            'preferred_time'   => $preferred_time,
+            'full_price'       => $full_price,
+            'deposit_amount'   => $deposit_amount,
+        )
+    );
 
     $remaining_balance = $full_price - $deposit_amount;
 
@@ -5839,6 +5822,39 @@ function custom_truelysell_include_postal_code_taxonomy_matches( $query ) {
 // Theme Options (Maps API Server field) so every Google Maps feature on
 // the site shares one key. Only used if that option is empty.
 define( 'TRUELYSELL_CHILD_GOOGLE_MAPS_API_KEY', 'AIzaSyADyKpKfpym_L-R_9BxGMzwp02wGEcllMM' );
+
+// ============================================================
+// GOHIGHLEVEL (GHL) WEBHOOK INTEGRATION
+// Sends new customer registrations, new technician registrations, and
+// new paid bookings to GoHighLevel. To wire each one up: in GHL, create/
+// open a Workflow, add an "Inbound Webhook" trigger, and paste the URL it
+// generates into the matching constant below. Any left blank simply never
+// fire — nothing else needs to change.
+// ============================================================
+define( 'TRUELYSELL_CHILD_GHL_WEBHOOK_CUSTOMER_URL', '' );
+define( 'TRUELYSELL_CHILD_GHL_WEBHOOK_TECHNICIAN_URL', '' );
+define( 'TRUELYSELL_CHILD_GHL_WEBHOOK_BOOKING_URL', '' );
+
+/**
+ * Fire-and-forget POST of a JSON payload to a GHL Inbound Webhook URL.
+ * Non-blocking (doesn't make the customer/technician wait on GHL's
+ * response) and never lets GHL being down/unset break the actual
+ * registration or booking that triggered it.
+ */
+function custom_truelysell_send_ghl_webhook( $url, $event, $payload ) {
+	if ( ! $url ) {
+		return;
+	}
+
+	$payload['event'] = $event;
+
+	wp_remote_post( $url, array(
+		'timeout'  => 5,
+		'blocking' => false,
+		'headers'  => array( 'Content-Type' => 'application/json' ),
+		'body'     => wp_json_encode( $payload ),
+	) );
+}
 
 add_action( 'wp_footer', 'custom_truelysell_profile_address_autocomplete' );
 function custom_truelysell_profile_address_autocomplete() {
