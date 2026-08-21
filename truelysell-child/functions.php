@@ -2040,6 +2040,97 @@ function custom_truelysell_fix_chat_now_recipient_and_visibility() {
 }
 
 /**
+ * The "Contact Provider" form on a technician's own profile page
+ * (#contact-provider-form, truelysell-child/template-parts/provider-
+ * details.php — this is the actual "customer selects a technician and
+ * sends them a message" entry point) posts to itself (action="",
+ * method="POST") with no PHP anywhere in this theme processing
+ * name="submit_contact_form" — and whatever the plugin's own frontend.js
+ * does with it (if it intercepts it at all) does not write into the same
+ * conversation table the technician's real Inbox reads from. That's why
+ * a message "sent" from a technician's profile page never shows up in
+ * their Inbox: it's a completely separate, disconnected form from the
+ * "Chat Now" widget's #booking_messages modal fixed above. Submit it
+ * instead through the plugin's own confirmed-working truelysell_send_message
+ * AJAX action (recipient + message) — the same one already used by the
+ * "Chat Now" fixes elsewhere on this site — so a message sent from this
+ * form lands in the exact same inbox conversation as any other chat
+ * message. Only handles the logged-in case (this form's the customer↔
+ * technician messaging system, which requires a real account on both
+ * ends); a logged-out visitor submitting it is a pre-existing no-op,
+ * unchanged here.
+ */
+add_action( 'wp_footer', 'custom_truelysell_fix_contact_provider_form' );
+function custom_truelysell_fix_contact_provider_form() {
+	if ( ! is_user_logged_in() ) {
+		return;
+	}
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var form = document.getElementById('contact-provider-form');
+		if ( ! form ) {
+			return;
+		}
+
+		form.addEventListener('submit', function (e) {
+			e.preventDefault();
+			e.stopImmediatePropagation();
+
+			var providerField = form.querySelector('input[name="provider_id"]');
+			var messageField  = form.querySelector('textarea[name="comment"]');
+			var button        = form.querySelector('button[type="submit"]');
+			var recipient     = providerField ? providerField.value : '';
+			var message       = messageField ? messageField.value : '';
+
+			if ( ! recipient || ! message ) {
+				return;
+			}
+
+			var formData = new FormData();
+			formData.append('action', 'truelysell_send_message');
+			formData.append('recipient', recipient);
+			formData.append('referral', '');
+			formData.append('message', message);
+
+			if ( button ) {
+				button.setAttribute('disabled', 'disabled');
+			}
+
+			fetch( <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>, { method: 'POST', body: formData } )
+				.then(function (r) { return r.json(); })
+				.then(function (data) {
+					if ( button ) {
+						button.removeAttribute('disabled');
+					}
+					if ( data && data.type === 'success' ) {
+						if ( messageField ) {
+							messageField.value = '';
+						}
+						var successModalEl = document.getElementById('successModal');
+						if ( successModalEl && window.bootstrap && window.bootstrap.Modal ) {
+							new window.bootstrap.Modal( successModalEl ).show();
+						} else if ( successModalEl ) {
+							successModalEl.classList.add('show');
+							successModalEl.style.display = 'block';
+						}
+					} else {
+						window.alert( ( data && data.message ) ? data.message : <?php echo wp_json_encode( __( 'Could not send your message. Please try again.', 'truelysell' ) ); ?> );
+					}
+				})
+				.catch(function () {
+					if ( button ) {
+						button.removeAttribute('disabled');
+					}
+					window.alert( <?php echo wp_json_encode( __( 'Network error. Please try again.', 'truelysell' ) ); ?> );
+				});
+		}, true );
+	});
+	</script>
+	<?php
+}
+
+/**
  * Lets a provider remove an Admin-managed listing from their own "My
  * Services" — e.g. they no longer want to offer that service — WITHOUT
  * touching the shared listing post itself, which stays exactly as-is for
@@ -4731,7 +4822,26 @@ function custom_enforce_phone_number_on_profile_save() {
     if ( ! is_user_logged_in() ) {
         return;
     }
-    $phone = isset( $_POST['phone_number'] ) ? trim( sanitize_text_field( $_POST['phone_number'] ) ) : '';
+    /*
+     * The plugin's "My Account" page has several distinct tabs/forms
+     * (Edit Profile, Payout Settings, Password, ...) that ALL post with
+     * the same shared my-account-submission=1 flag — it's not unique to
+     * the profile-edit form. Only the profile-edit form actually includes
+     * a phone_number field at all; the Payout Settings form (e.g. saving
+     * a PayPal payout email) does not, so isset() below was always false
+     * for it and this hook redirected every payout save back with a
+     * "Phone Number is required" error even though the technician wasn't
+     * touching their phone number. Bail out here — before validating
+     * anything — for any submission that isn't actually the profile form,
+     * exactly like the other my-account-submission hooks in this file
+     * (custom_truelysell_save_profile_travel_radius,
+     * custom_truelysell_save_profile_lat_lng) already scope themselves to
+     * only the fields that exist on the tab they care about.
+     */
+    if ( ! isset( $_POST['phone_number'] ) ) {
+        return;
+    }
+    $phone = trim( sanitize_text_field( $_POST['phone_number'] ) );
     if ( empty( $phone ) ) {
         // Redirect back with an error query string so the theme shows an error
         $profile_page = truelysell_fl_framework_getoptions( 'profile_page' );
