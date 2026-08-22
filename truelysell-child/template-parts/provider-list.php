@@ -114,11 +114,22 @@ if (isset($_GET['author_id'])) {
   $category_listing_ids = get_posts( $listing_query_args );
 
   /*
-   * The real technicians/providers offering these services are the ones
-   * LINKED to each listing (custom_truelysell_get_listing_linked_provider_ids()),
-   * not the listing's post_author — every listing in the public catalog
-   * is authored by Admin. Collect the union of eligible linked providers
-   * for a given set of listing IDs.
+   * The real technicians/providers offering these services are usually the
+   * ones LINKED to each listing (custom_truelysell_get_listing_linked_provider_ids()),
+   * since most listings in the public catalog are Admin-authored duplicates
+   * a provider got merged into (see custom_truelysell_prevent_duplicate_service_creation()
+   * in functions.php). But that merge only happens when a matching
+   * Admin-authored listing with the same title already exists at the time
+   * the provider adds their service — if it doesn't yet, their own listing
+   * stays exactly as they authored it: a real, standalone, published
+   * `listing` post with post_author = that provider, never linked via
+   * _linked_provider_ids/_assigned_technician_id at all. Without also
+   * checking post_author here, that provider is invisible on this page
+   * forever even though their service is live and bookable — this is why
+   * some Owner-role accounts with real "Services Selected" counts never
+   * showed up in the public directory. Same post_author fallback already
+   * used elsewhere on this site (e.g. the booking-assignment logic in
+   * custom_truelysell_ajax_book_service()).
    */
   $get_eligible_linked_providers = function ( $listing_ids ) {
       $ids = array();
@@ -130,6 +141,11 @@ if (isset($_GET['author_id'])) {
               if ( function_exists( 'custom_truelysell_is_restricted_provider' ) && custom_truelysell_is_restricted_provider( $linked_id ) ) {
                   $ids[] = $linked_id;
               }
+          }
+
+          $post_author_id = absint( get_post_field( 'post_author', $listing_id ) );
+          if ( $post_author_id && function_exists( 'custom_truelysell_is_restricted_provider' ) && custom_truelysell_is_restricted_provider( $post_author_id ) ) {
+              $ids[] = $post_author_id;
           }
       }
       return $ids;

@@ -4435,6 +4435,599 @@ function custom_truelysell_register_deposit_commission( $order, $owner_id, $book
 }
 
 // ============================================================
+// REMAINING BALANCE (80%) — MUTUAL JOB-COMPLETE CONFIRMATION + SETTLEMENT
+// ------------------------------------------------------------------
+// The 20% deposit is the only amount that flows through the platform's
+// own PayPal at booking time — the remaining balance was, until now,
+// always cash the provider collects directly (see
+// custom_truelysell_register_deposit_commission() above). This adds an
+// online path for that remaining balance, gated behind a mutual
+// confirmation step so neither side can unilaterally force it:
+//   1. Technician clicks "Mark Job Complete" on their booking row.
+//   2. Customer is notified and must separately click "Confirm Job
+//      Complete" themselves.
+//   3. Only once BOTH have confirmed can the customer click "Pay
+//      Remaining Balance" — a second, full-value WooCommerce order is
+//      created for the exact remaining amount and they're sent to
+//      PayPal to pay it themselves (no cash option — per the site
+//      owner, customers essentially never pay cash in practice).
+// That payment marks the booking fully settled. Per the site owner's
+// explicit choice, the platform takes NO commission on this remaining
+// amount either way — same as cash always was, the full amount is
+// registered as a 100%-rate commission so it lands in the technician's
+// own payout balance (the existing admin Payout screen pays it out),
+// it just also happens to have moved through the platform's PayPal
+// this time instead of being handed over in person.
+// ============================================================
+
+/**
+ * All of this feature's state lives as meta on the ORIGINAL deposit
+ * order (found via the booking row's own `order_id` column) — never a
+ * new custom table, so it reuses the exact same WC order meta pattern
+ * (and HPOS-safety) as custom_truelysell_finalize_deposit_booking().
+ */
+function custom_truelysell_get_job_completion_state( $order ) {
+	$technician_marked = (bool) $order->get_meta( '_truelysell_job_marked_complete_by_technician' );
+	$customer_confirmed = (bool) $order->get_meta( '_truelysell_job_confirmed_complete_by_customer' );
+	$remaining_settled  = (bool) $order->get_meta( '_truelysell_remaining_settled' );
+
+	return array(
+		'technician_marked_complete' => $technician_marked,
+		'customer_confirmed_complete' => $customer_confirmed,
+		'both_confirmed'             => $technician_marked && $customer_confirmed,
+		'remaining_settled'          => $remaining_settled,
+		'remaining_payment_method'   => $order->get_meta( '_truelysell_remaining_payment_method' ),
+		'remaining_order_id'         => absint( $order->get_meta( '_truelysell_remaining_order_id' ) ),
+		'remaining_amount'           => (float) $order->get_meta( '_truelysell_full_price' ) - (float) $order->get_meta( '_truelysell_deposit_amount' ),
+	);
+}
+
+/**
+ * Bridges a `bookings_calendar` row to the state above. Deliberately
+ * defined here in the child theme (not inc/template-tags.php, even
+ * though that's where the customer/provider bookings shortcodes that
+ * call it live) so this whole feature only ever depends on ONE file
+ * being uploaded — this one. Splitting it across the parent theme's
+ * inc/template-tags.php and this file caused real deployment confusion:
+ * this file could be fully up to date while template-tags.php lagged
+ * behind, silently making every "Remaining Balance" column show "—"
+ * with no visible error.
+ */
+if ( ! function_exists( 'truelysell_get_booking_job_completion_state' ) ) {
+	function truelysell_get_booking_job_completion_state( $booking ) {
+		// Only ever relevant while the booking is actually in force — a
+		// cancelled/expired booking has no remaining balance to settle.
+		if ( ! in_array( $booking->status, array( 'paid', 'confirmed' ), true ) ) {
+			return null;
+		}
+
+		if ( empty( $booking->order_id ) || ! function_exists( 'wc_get_order' ) ) {
+			return null;
+		}
+
+		$order = wc_get_order( absint( $booking->order_id ) );
+		if ( ! $order || ! $order->get_meta( '_truelysell_booking_created' ) ) {
+			return null;
+		}
+
+		return custom_truelysell_get_job_completion_state( $order );
+	}
+}
+
+/**
+ * Same booking-row -> order resolution every one of these handlers
+ * needs: load the booking, confirm the deposit was actually finalized
+ * (booking_created meta), and load the order it belongs to.
+ */
+function custom_truelysell_load_booking_and_order_for_completion( $booking_id ) {
+	if ( ! function_exists( 'custom_truelysell_get_booking_by_id' ) ) {
+		return array( null, null );
+	}
+
+	$booking = custom_truelysell_get_booking_by_id( $booking_id );
+	if ( ! $booking || empty( $booking->order_id ) ) {
+		return array( null, null );
+	}
+
+	$order = wc_get_order( absint( $booking->order_id ) );
+	if ( ! $order || ! $order->get_meta( '_truelysell_booking_created' ) ) {
+		return array( null, null );
+	}
+
+	return array( $booking, $order );
+}
+
+add_action( 'wp_ajax_truelysell_mark_job_complete', 'custom_truelysell_ajax_mark_job_complete' );
+function custom_truelysell_ajax_mark_job_complete() {
+	if ( ! check_ajax_referer( 'truelysell_job_completion_nonce', 'nonce', false ) ) {
+		wp_send_json_error( 'Security check failed.' );
+	}
+	if ( ! is_user_logged_in() ) {
+		wp_send_json_error( 'Please log in.' );
+	}
+
+	$booking_id = absint( $_POST['booking_id'] ?? 0 );
+	list( $booking, $order ) = custom_truelysell_load_booking_and_order_for_completion( $booking_id );
+	if ( ! $booking || ! $order ) {
+		wp_send_json_error( 'Booking not found.' );
+	}
+
+	// Only the assigned technician for this exact booking may mark it complete.
+	if ( absint( $booking->owner_id ) !== get_current_user_id() ) {
+		wp_send_json_error( 'You are not the assigned technician for this booking.' );
+	}
+
+	$state = custom_truelysell_get_job_completion_state( $order );
+	if ( $state['remaining_settled'] ) {
+		wp_send_json_error( 'This booking is already fully settled.' );
+	}
+	if ( $state['technician_marked_complete'] ) {
+		wp_send_json_success( array( 'message' => 'Already marked complete.' ) );
+	}
+
+	$order->update_meta_data( '_truelysell_job_marked_complete_by_technician', 1 );
+	$order->update_meta_data( '_truelysell_job_marked_complete_by_technician_time', current_time( 'mysql' ) );
+	$order->save_meta_data();
+	$order->add_order_note( 'Truelysell: technician marked the job complete — awaiting customer confirmation.' );
+
+	$customer_email = $order->get_meta( '_truelysell_email' );
+	if ( is_email( $customer_email ) ) {
+		$technician_name = get_userdata( $booking->owner_id );
+		wp_mail(
+			$customer_email,
+			sprintf( __( '%s says your service is complete', 'truelysell' ), $technician_name ? $technician_name->display_name : __( 'Your technician', 'truelysell' ) ),
+			sprintf(
+				"%s has marked booking #%d as complete.\n\nIf the work is done to your satisfaction, please log in and confirm completion so you can settle the remaining balance.\n\nBooking ID: #%d",
+				$technician_name ? $technician_name->display_name : __( 'Your technician', 'truelysell' ),
+				$booking_id, $booking_id
+			)
+		);
+	}
+
+	wp_send_json_success( array( 'message' => __( 'Marked complete. The customer has been notified to confirm.', 'truelysell' ) ) );
+}
+
+add_action( 'wp_ajax_truelysell_confirm_job_complete', 'custom_truelysell_ajax_confirm_job_complete' );
+function custom_truelysell_ajax_confirm_job_complete() {
+	if ( ! check_ajax_referer( 'truelysell_job_completion_nonce', 'nonce', false ) ) {
+		wp_send_json_error( 'Security check failed.' );
+	}
+	if ( ! is_user_logged_in() ) {
+		wp_send_json_error( 'Please log in.' );
+	}
+
+	$booking_id = absint( $_POST['booking_id'] ?? 0 );
+	list( $booking, $order ) = custom_truelysell_load_booking_and_order_for_completion( $booking_id );
+	if ( ! $booking || ! $order ) {
+		wp_send_json_error( 'Booking not found.' );
+	}
+
+	// Only the customer who made this exact booking may confirm it.
+	if ( absint( $booking->bookings_author ) !== get_current_user_id() ) {
+		wp_send_json_error( 'This is not your booking.' );
+	}
+
+	$state = custom_truelysell_get_job_completion_state( $order );
+	if ( $state['remaining_settled'] ) {
+		wp_send_json_error( 'This booking is already fully settled.' );
+	}
+	if ( ! $state['technician_marked_complete'] ) {
+		wp_send_json_error( 'The technician has not marked this job complete yet.' );
+	}
+	if ( $state['customer_confirmed_complete'] ) {
+		wp_send_json_success( array( 'message' => 'Already confirmed.', 'remaining_amount' => $state['remaining_amount'] ) );
+	}
+
+	$order->update_meta_data( '_truelysell_job_confirmed_complete_by_customer', 1 );
+	$order->update_meta_data( '_truelysell_job_confirmed_complete_by_customer_time', current_time( 'mysql' ) );
+	$order->save_meta_data();
+	$order->add_order_note( 'Truelysell: customer confirmed the job is complete — remaining balance can now be settled.' );
+
+	$owner_info = get_userdata( $booking->owner_id );
+	if ( $owner_info && is_email( $owner_info->user_email ) ) {
+		wp_mail(
+			$owner_info->user_email,
+			sprintf( __( 'Customer confirmed booking #%d is complete', 'truelysell' ), $booking_id ),
+			sprintf( "The customer confirmed booking #%d is complete. They can now pay the remaining balance online.\n\nBooking ID: #%d", $booking_id, $booking_id )
+		);
+	}
+
+	wp_send_json_success( array(
+		'message'          => __( 'Confirmed. You can now pay the remaining balance.', 'truelysell' ),
+		'remaining_amount' => $state['remaining_amount'],
+	) );
+}
+
+add_action( 'wp_ajax_truelysell_pay_remaining_balance', 'custom_truelysell_ajax_pay_remaining_balance' );
+function custom_truelysell_ajax_pay_remaining_balance() {
+	if ( ! check_ajax_referer( 'truelysell_job_completion_nonce', 'nonce', false ) ) {
+		wp_send_json_error( 'Security check failed.' );
+	}
+	if ( ! is_user_logged_in() ) {
+		wp_send_json_error( 'Please log in.' );
+	}
+
+	$booking_id = absint( $_POST['booking_id'] ?? 0 );
+	list( $booking, $order ) = custom_truelysell_load_booking_and_order_for_completion( $booking_id );
+	if ( ! $booking || ! $order ) {
+		wp_send_json_error( 'Booking not found.' );
+	}
+
+	if ( absint( $booking->bookings_author ) !== get_current_user_id() ) {
+		wp_send_json_error( 'This is not your booking.' );
+	}
+
+	$state = custom_truelysell_get_job_completion_state( $order );
+	if ( ! $state['both_confirmed'] ) {
+		wp_send_json_error( 'Both you and the technician need to confirm the job is complete first.' );
+	}
+	if ( $state['remaining_settled'] ) {
+		wp_send_json_error( 'This booking is already fully settled.' );
+	}
+
+	// Idempotent: reuse an existing unpaid/pending remaining-balance order
+	// rather than creating a fresh one every time this is clicked (e.g. the
+	// customer navigates back to it, or double-clicks).
+	if ( $state['remaining_order_id'] ) {
+		$existing_remaining_order = wc_get_order( $state['remaining_order_id'] );
+		if ( $existing_remaining_order && ! $existing_remaining_order->is_paid() && 'cancelled' !== $existing_remaining_order->get_status() ) {
+			wp_send_json_success( array( 'redirect_url' => $existing_remaining_order->get_checkout_payment_url() ) );
+		}
+	}
+
+	$listing_id     = absint( $order->get_meta( '_truelysell_listing_id' ) );
+	$product_id     = get_post_meta( $listing_id, '_product_id', true );
+	$remaining_amount = $state['remaining_amount'];
+
+	if ( ! $product_id || $remaining_amount <= 0 || ! function_exists( 'wc_create_order' ) ) {
+		wp_send_json_error( 'Unable to create the remaining-balance payment right now. Please contact us.' );
+	}
+
+	$args                        = array();
+	$args['totals']['subtotal']  = $remaining_amount;
+	$args['totals']['total']     = $remaining_amount;
+
+	$remaining_order = wc_create_order();
+	$item_id         = $remaining_order->add_product( wc_get_product( $product_id ), 1, $args );
+	$item            = $item_id ? $remaining_order->get_item( $item_id ) : null;
+	if ( $item ) {
+		$item->set_name( get_the_title( $listing_id ) . ' — ' . __( 'Remaining Balance', 'truelysell' ) );
+		$item->save();
+	}
+
+	$address = array(
+		'first_name' => $order->get_meta( '_truelysell_first_name' ),
+		'last_name'  => $order->get_meta( '_truelysell_last_name' ),
+		'email'      => $order->get_meta( '_truelysell_email' ),
+		'phone'      => $order->get_meta( '_truelysell_phone' ),
+		'country'    => $order->get_billing_country(),
+		'address_1'  => $order->get_meta( '_truelysell_customer_address' ),
+	);
+	$remaining_order->set_address( $address, 'billing' );
+	$remaining_order->set_address( $address, 'shipping' );
+	$remaining_order->set_customer_id( get_current_user_id() );
+	$remaining_order->set_billing_email( $address['email'] );
+
+	// Links back to the original deposit order/booking so the payment-
+	// complete hook below knows exactly what this order is settling.
+	$remaining_order->update_meta_data( '_truelysell_remaining_of_order_id', $order->get_id() );
+	$remaining_order->update_meta_data( '_truelysell_booking_id', $booking_id );
+	$remaining_order->update_meta_data( '_truelysell_listing_id', $listing_id );
+	$remaining_order->update_meta_data( '_truelysell_owner_id', $booking->owner_id );
+	$remaining_order->calculate_totals();
+	$remaining_order->save();
+
+	$order->update_meta_data( '_truelysell_remaining_order_id', $remaining_order->get_id() );
+	$order->save_meta_data();
+	$order->add_order_note( sprintf( 'Truelysell: remaining-balance order #%d created for customer to pay online.', $remaining_order->get_id() ) );
+
+	wp_send_json_success( array( 'redirect_url' => $remaining_order->get_checkout_payment_url() ) );
+}
+
+/**
+ * Fires when the SEPARATE remaining-balance order (created above) actually
+ * clears — distinguished from the original deposit order purely by the
+ * presence of _truelysell_remaining_of_order_id, which only that order
+ * ever has. Registers the full amount as a 100%-rate commission (per the
+ * site owner's choice: platform takes nothing extra here, same as cash
+ * always was) so it lands in the technician's payout balance exactly like
+ * any other commission, then notifies both sides.
+ */
+add_action( 'woocommerce_payment_complete', 'custom_truelysell_settle_remaining_balance_online' );
+function custom_truelysell_settle_remaining_balance_online( $remaining_order_id ) {
+	$remaining_order = wc_get_order( $remaining_order_id );
+	if ( ! $remaining_order ) {
+		return;
+	}
+
+	$original_order_id = absint( $remaining_order->get_meta( '_truelysell_remaining_of_order_id' ) );
+	if ( ! $original_order_id ) {
+		return; // Not a remaining-balance order — nothing to do here.
+	}
+
+	$order = wc_get_order( $original_order_id );
+	if ( ! $order || $order->get_meta( '_truelysell_remaining_settled' ) ) {
+		return; // Already settled — don't double-register (e.g. duplicate payment_complete + order_status_changed firing for the same order).
+	}
+
+	$booking_id = absint( $remaining_order->get_meta( '_truelysell_booking_id' ) );
+	$owner_id   = absint( $remaining_order->get_meta( '_truelysell_owner_id' ) );
+	$listing_id = absint( $remaining_order->get_meta( '_truelysell_listing_id' ) );
+	$amount     = (float) $remaining_order->get_total();
+
+	$order->update_meta_data( '_truelysell_remaining_settled', 1 );
+	$order->update_meta_data( '_truelysell_remaining_payment_method', 'online' );
+	$order->save_meta_data();
+	$order->add_order_note( sprintf( 'Truelysell: remaining balance of %s paid online via order #%d — booking fully settled.', wp_strip_all_tags( wc_price( $amount ) ), $remaining_order_id ) );
+
+	if ( class_exists( 'Truelysell_Core_Commissions' ) ) {
+		$commission_id = Truelysell_Core_Commissions::instance()->insert_commission( array(
+			'order_id'   => $remaining_order_id,
+			'user_id'    => $owner_id,
+			'booking_id' => $booking_id,
+			'listing_id' => $listing_id,
+			'rate'       => 1, // No platform commission on the remaining balance — same as cash always was.
+			'status'     => 'unpaid',
+			'amount'     => $amount,
+			'type'       => 'percentage',
+		) );
+		if ( $commission_id ) {
+			$remaining_order->update_meta_data( '_truelysell_commissions_id', $commission_id );
+			$remaining_order->update_meta_data( '_truelysell_commissions_processed', 'yes' );
+			$remaining_order->save_meta_data();
+		}
+	}
+
+	$owner_info = get_userdata( $owner_id );
+	if ( $owner_info && is_email( $owner_info->user_email ) ) {
+		wp_mail(
+			$owner_info->user_email,
+			sprintf( __( 'Remaining balance paid online — booking #%d', 'truelysell' ), $booking_id ),
+			sprintf( "The customer paid the remaining balance of %s online for booking #%d. The full amount has been added to your payout balance.\n\nBooking ID: #%d", wp_strip_all_tags( wc_price( $amount ) ), $booking_id, $booking_id )
+		);
+	}
+
+	$customer_email = $order->get_meta( '_truelysell_email' );
+	if ( is_email( $customer_email ) ) {
+		wp_mail(
+			$customer_email,
+			sprintf( __( 'Payment received — booking #%d fully settled', 'truelysell' ), $booking_id ),
+			sprintf( "Thank you! Your payment of %s has been received and booking #%d is now fully settled.\n\nBooking ID: #%d", wp_strip_all_tags( wc_price( $amount ) ), $booking_id, $booking_id )
+		);
+	}
+}
+
+/**
+ * Same safety net as custom_truelysell_create_booking_on_status_change()
+ * above, for the same reason: not every gateway reliably fires
+ * woocommerce_payment_complete, but woocommerce_order_status_changed
+ * always fires on any status transition. custom_truelysell_settle_
+ * remaining_balance_online() is idempotent (bails immediately if this
+ * isn't a remaining-balance order, or it's already settled), so calling
+ * it from both hooks for the same order is harmless.
+ */
+add_action( 'woocommerce_order_status_changed', 'custom_truelysell_settle_remaining_balance_on_status_change', 5, 3 );
+function custom_truelysell_settle_remaining_balance_on_status_change( $order_id, $old_status, $new_status ) {
+	if ( in_array( $new_status, array( 'processing', 'completed' ), true ) ) {
+		custom_truelysell_settle_remaining_balance_online( $order_id );
+	}
+}
+
+/**
+ * Buttons for the job-completion flow above render inside the provider/
+ * customer bookings shortcodes (inc/template-tags.php) with
+ * data-truelysell-job-action attributes — bind one shared click handler
+ * here rather than duplicating fetch/AJAX boilerplate per button.
+ */
+add_action( 'wp_footer', 'custom_truelysell_render_job_completion_js' );
+function custom_truelysell_render_job_completion_js() {
+	if ( ! is_user_logged_in() ) {
+		return;
+	}
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		document.addEventListener('click', function (e) {
+			var btn = e.target.closest('[data-truelysell-job-action]');
+			if (!btn) {
+				return;
+			}
+			e.preventDefault();
+
+			var action    = btn.getAttribute('data-truelysell-job-action');
+			var bookingId = btn.getAttribute('data-booking-id');
+			if (!action || !bookingId || btn.disabled) {
+				return;
+			}
+
+			btn.disabled = true;
+			var originalText = btn.textContent;
+			btn.textContent = <?php echo wp_json_encode( __( 'Please wait…', 'truelysell' ) ); ?>;
+
+			var formData = new FormData();
+			formData.append('action', action);
+			formData.append('booking_id', bookingId);
+			formData.append('nonce', <?php echo wp_json_encode( wp_create_nonce( 'truelysell_job_completion_nonce' ) ); ?>);
+
+			fetch( <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>, { method: 'POST', body: formData } )
+				.then(function (r) { return r.json(); })
+				.then(function (data) {
+					if (data && data.success) {
+						if (data.data && data.data.redirect_url) {
+							window.location.href = data.data.redirect_url;
+							return;
+						}
+						window.location.reload();
+					} else {
+						btn.disabled = false;
+						btn.textContent = originalText;
+						window.alert( ( data && data.data && data.data.message ) ? data.data.message : ( ( data && data.data ) || <?php echo wp_json_encode( __( 'Something went wrong. Please try again.', 'truelysell' ) ); ?> ) );
+					}
+				})
+				.catch(function () {
+					btn.disabled = false;
+					btn.textContent = originalText;
+					window.alert( <?php echo wp_json_encode( __( 'Network error. Please try again.', 'truelysell' ) ); ?> );
+				});
+		});
+	});
+	</script>
+	<?php
+}
+
+/**
+ * The job-completion buttons built into the [truelysell_provider_bookings]/
+ * [truelysell_customer_bookings] shortcodes (inc/template-tags.php) only
+ * ever render if the_content actually got replaced by those shortcodes on
+ * a given page. In practice, the real Booking List / My Bookings /
+ * Dashboard "Recent Bookings" widget all render the plugin's own native,
+ * unreplaced booking-row template instead — same #booking-list-{ID} row
+ * markup, same actions-row selector already used by the "Rate Customer"
+ * injection above (custom_truelysell_render_rate_customer_ui()), confirmed
+ * by that exact button showing up on the live Booking List page. Inject
+ * the same job-completion controls into every one of those pages the same
+ * way, so they show up wherever the technician/customer actually lands —
+ * this is a pure addition to the existing native row, so it never changes
+ * that page's existing look.
+ */
+add_action( 'wp_footer', 'custom_truelysell_render_job_completion_dashboard_widget_buttons' );
+function custom_truelysell_render_job_completion_dashboard_widget_buttons() {
+	$user_id = get_current_user_id();
+	if ( ! $user_id ) {
+		return;
+	}
+
+	$dashboard_page     = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'dashboard_page' ) : 0;
+	$bookings_page      = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'bookings_page' ) : 0;
+	$user_bookings_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'user_bookings_page' ) : 0;
+	$current_page       = get_queried_object_id();
+
+	$on_relevant_page = ( $dashboard_page && absint( $dashboard_page ) === absint( $current_page ) )
+		|| ( $bookings_page && absint( $bookings_page ) === absint( $current_page ) )
+		|| ( $user_bookings_page && absint( $user_bookings_page ) === absint( $current_page ) );
+
+	if ( ! $on_relevant_page ) {
+		return;
+	}
+
+	if ( ! function_exists( 'truelysell_get_booking_job_completion_state' ) ) {
+		return;
+	}
+
+	$is_provider = custom_truelysell_is_restricted_provider( $user_id );
+
+	if ( $is_provider ) {
+		if ( ! function_exists( 'truelysell_get_provider_bookings' ) ) {
+			return;
+		}
+		$bookings = truelysell_get_provider_bookings( $user_id );
+	} else {
+		if ( ! function_exists( 'truelysell_get_customer_bookings' ) ) {
+			return;
+		}
+		$bookings = truelysell_get_customer_bookings( $user_id );
+	}
+
+	$rows = array();
+	foreach ( $bookings as $booking ) {
+		$state = truelysell_get_booking_job_completion_state( $booking );
+		if ( null === $state || $state['remaining_settled'] ) {
+			continue; // Nothing actionable to inject for this row.
+		}
+		$rows[ absint( $booking->ID ) ] = array(
+			'technician_marked_complete' => $state['technician_marked_complete'],
+			'both_confirmed'             => $state['both_confirmed'],
+			'remaining_amount'           => round( $state['remaining_amount'], 2 ),
+			// The native row's own "Amount" line always shows the full listing
+			// price (e.g. "$120.00") with no indication that only the 20%
+			// deposit has actually cleared — easy to misread as fully paid.
+			'deposit_amount'             => round( (float) $booking->price - $state['remaining_amount'], 2 ),
+		);
+	}
+
+	if ( empty( $rows ) ) {
+		return;
+	}
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var rows          = <?php echo wp_json_encode( $rows ); ?>;
+		var isProvider    = <?php echo wp_json_encode( $is_provider ); ?>;
+		var currencySymbol = <?php echo wp_json_encode( function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '$' ); ?>;
+
+		Object.keys(rows).forEach(function (bookingId) {
+			var info = rows[bookingId];
+			var row  = document.getElementById('booking-list-' + bookingId);
+			if (!row) {
+				return;
+			}
+
+			// Clarify the "Amount" line (which always shows the full price,
+			// e.g. "$120.00", regardless of how much has actually cleared) so
+			// it doesn't read as if the whole amount had been paid.
+			var amountLi = null;
+			row.querySelectorAll('.booking-details li').forEach(function (li) {
+				var label = li.querySelector('.book-item');
+				if (label && label.textContent.trim() === 'Amount') {
+					amountLi = li;
+				}
+			});
+			if (amountLi && !amountLi.querySelector('.truelysell-deposit-note')) {
+				var note = document.createElement('span');
+				note.className = 'truelysell-deposit-note fs-12 text-muted ms-2';
+				note.textContent = '(' + <?php echo wp_json_encode( __( 'Deposit paid:', 'truelysell' ) ); ?> + ' ' + currencySymbol + info.deposit_amount.toFixed(2) + <?php echo wp_json_encode( __( ' • Remaining:', 'truelysell' ) ); ?> + ' ' + currencySymbol + info.remaining_amount.toFixed(2) + ')';
+				amountLi.appendChild(note);
+			}
+
+			var actionsRow = row.querySelector('.d-flex.align-items-center.flex-wrap.row-gap-2');
+			if (!actionsRow || !actionsRow.parentNode) {
+				return;
+			}
+
+			var wrapper = document.createElement('div');
+			wrapper.className = 'd-flex align-items-center flex-wrap row-gap-2 mt-2';
+
+			function addButton(label, action, classes) {
+				var btn = document.createElement('button');
+				btn.type = 'button';
+				btn.className = 'btn w-100 mb-2 ' + classes;
+				btn.textContent = label;
+				btn.setAttribute('data-truelysell-job-action', action);
+				btn.setAttribute('data-booking-id', bookingId);
+				wrapper.appendChild(btn);
+			}
+
+			function addStatusText(text) {
+				var span = document.createElement('span');
+				span.className = 'fs-12 text-muted mb-2';
+				span.textContent = text;
+				wrapper.appendChild(span);
+			}
+
+			if (info.both_confirmed) {
+				if (isProvider) {
+					addStatusText(<?php echo wp_json_encode( __( 'Waiting for customer to pay online', 'truelysell' ) ); ?>);
+				} else {
+					addButton(<?php echo wp_json_encode( __( 'Pay Remaining', 'truelysell' ) ); ?> + ' ' + currencySymbol + info.remaining_amount.toFixed(2), 'truelysell_pay_remaining_balance', 'btn-primary');
+				}
+			} else if (info.technician_marked_complete) {
+				if (!isProvider) {
+					addButton(<?php echo wp_json_encode( __( 'Confirm Job Complete', 'truelysell' ) ); ?>, 'truelysell_confirm_job_complete', 'btn-outline-success');
+				}
+			} else if (isProvider) {
+				addButton(<?php echo wp_json_encode( __( 'Mark Job Complete', 'truelysell' ) ); ?>, 'truelysell_mark_job_complete', 'btn-outline-success');
+			}
+
+			if (wrapper.children.length) {
+				actionsRow.parentNode.insertBefore(wrapper, actionsRow.nextSibling);
+			}
+		});
+	});
+	</script>
+	<?php
+}
+
+// ============================================================
 // FAVORITES / BOOKMARKS COMPLETE FIX - Child Theme
 // Problem 1: Heart icon click karne pe "Login to Favourite"
 //            modal show hota hai even when logged in
