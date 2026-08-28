@@ -1302,6 +1302,19 @@ function custom_truelysell_registration_handler( $user_id ) {
 				error_log( sprintf( 'custom_truelysell: no provider_services found for user_id=%d user_type=%s', $user_id, $user_type ) );
 			}
 		}
+
+		/*
+		 * The 20% platform fee notice + required checkbox is injected onto
+		 * the WPForms registration form client-side (see
+		 * custom_truelysell_render_technician_fee_agreement_notice()) — it
+		 * isn't a real WPForms field, just a plain checkbox placed inside
+		 * the same <form>, so it posts as a normal top-level $_POST key
+		 * rather than through $_POST['wpforms']['fields']. Record whether
+		 * it was actually checked, same pattern as every other custom
+		 * registration field this handler already stores.
+		 */
+		update_user_meta( $user_id, 'custom_truelysell_fee_agreement_accepted', ! empty( $_POST['custom_truelysell_fee_agreement'] ) ? '1' : '0' );
+		update_user_meta( $user_id, 'custom_truelysell_fee_agreement_accepted_time', current_time( 'mysql' ) );
 	}
 
 	$ghl_user_data = get_userdata( $user_id );
@@ -1322,6 +1335,20 @@ function custom_truelysell_registration_handler( $user_id ) {
 		)
 	);
 
+	/*
+	 * The theme's own "Registration/Welcome email for new users" settings
+	 * (Theme Options → Emails — welcome_email_disable / listing_welcome_
+	 * email_subject / listing_welcome_email_content) exist and are fully
+	 * configurable, but nothing ever actually sends using them on this
+	 * site — the plugin's own native code that normally would is tied to
+	 * its own native registration form/flow, which this site doesn't use
+	 * (registration goes through WPForms form 8203 instead, handled by
+	 * this function). Send it here instead, using the exact same
+	 * admin-configured subject/content, so customers and technicians
+	 * both get it regardless of which form created the account.
+	 */
+	custom_truelysell_send_theme_welcome_email( $user_id, $raw_fields );
+
 	/**
 	 * IMPORTANT FIX: Agar form submit karte waqt browser mein pehle se
 	 * koi dusra user (masalan Admin) login hai, to WordPress apne aap
@@ -1337,6 +1364,63 @@ function custom_truelysell_registration_handler( $user_id ) {
 	if ( ! $is_technician ) {
 		return;
 	}
+}
+
+/**
+ * Sends the theme's own configurable "Welcome Email" (Theme Options —
+ * see inc/options-init.php, section "Registration/Welcome email for new
+ * users") to a newly registered user, since nothing else on this site
+ * actually does. Supports the same {user_mail}/{user_name}/{site_name}/
+ * {password}/{login} tags the options screen itself documents.
+ */
+function custom_truelysell_send_theme_welcome_email( $user_id, $raw_fields = array() ) {
+	if ( ! function_exists( 'truelysell_fl_framework_getoptions' ) ) {
+		return;
+	}
+
+	if ( truelysell_fl_framework_getoptions( 'welcome_email_disable' ) ) {
+		return;
+	}
+
+	$user = get_userdata( $user_id );
+	if ( ! $user || ! is_email( $user->user_email ) ) {
+		return;
+	}
+
+	$subject = truelysell_fl_framework_getoptions( 'listing_welcome_email_subject' );
+	$content = truelysell_fl_framework_getoptions( 'listing_welcome_email_content' );
+
+	if ( ! $subject ) {
+		$subject = __( 'Welcome to {site_name}', 'truelysell' );
+	}
+	if ( ! $content ) {
+		$content = __( 'Hi {user_name},<br>Welcome to our website.<br>Username: {login}<br>Thank you.', 'truelysell' );
+	}
+
+	/*
+	 * The plain password only exists in $_POST at all while this request
+	 * is still handling the original form submission — by the time
+	 * wp_insert_user() ran, it's already hashed in the database. WPForms'
+	 * own Password field is the only place it's still available here.
+	 * If this form/submission doesn't have one (e.g. WPForms generated a
+	 * random password instead), fall back to a safe, sensible phrase
+	 * rather than leaving a blank in the email.
+	 */
+	$plain_password = custom_truelysell_wpforms_get_field_value_by_label_keywords( $raw_fields, array( 'password' ) );
+	$password_display = $plain_password ? $plain_password : __( '(the password you set during registration)', 'truelysell' );
+
+	$tags = array(
+		'{user_mail}' => $user->user_email,
+		'{user_name}' => $user->display_name ? $user->display_name : $user->user_login,
+		'{site_name}' => get_bloginfo( 'name' ),
+		'{password}'  => $password_display,
+		'{login}'     => $user->user_login,
+	);
+
+	$subject = strtr( $subject, $tags );
+	$body    = strtr( $content, $tags );
+
+	wp_mail( $user->user_email, $subject, $body, array( 'Content-Type: text/html; charset=UTF-8' ) );
 }
 
 /**
@@ -1507,6 +1591,164 @@ function custom_truelysell_wpforms_map_field_values_to_labels( $form_id, $field_
 	}
 
 	return implode( ', ', $labels );
+}
+
+/**
+ * Every choice (value + label) defined for one WPForms field, straight
+ * from the form's own saved definition — same data source already used
+ * by custom_truelysell_wpforms_map_field_values_to_labels() above.
+ */
+function custom_truelysell_get_wpforms_field_choices( $form_id, $field_id ) {
+	if ( ! function_exists( 'wpforms' ) ) {
+		return array();
+	}
+
+	$wpforms = wpforms();
+	if ( ! isset( $wpforms->form ) ) {
+		return array();
+	}
+
+	$form = $wpforms->form->get( absint( $form_id ) );
+	if ( ! $form || empty( $form->post_content ) ) {
+		return array();
+	}
+
+	$form_data = json_decode( $form->post_content, true );
+	if ( empty( $form_data['fields'][ $field_id ]['choices'] ) || ! is_array( $form_data['fields'][ $field_id ]['choices'] ) ) {
+		return array();
+	}
+
+	$choices = array();
+	foreach ( $form_data['fields'][ $field_id ]['choices'] as $choice ) {
+		$label = isset( $choice['label'] ) ? (string) $choice['label'] : '';
+		$value = isset( $choice['value'] ) && '' !== $choice['value'] ? (string) $choice['value'] : $label;
+		$choices[] = array( 'value' => $value, 'label' => $label );
+	}
+
+	return $choices;
+}
+
+/**
+ * Which of this field's choice VALUES actually mean "registering as a
+ * technician" — same keyword list custom_truelysell_registration_handler()
+ * already compares the submitted value against, so this always agrees
+ * with how registrations actually get classified server-side.
+ */
+function custom_truelysell_get_wpforms_technician_choice_values( $form_id, $field_id ) {
+	$technician_keywords = array( 'technician', 'provider', 'owner', 'service provider' );
+	$matches = array();
+
+	foreach ( custom_truelysell_get_wpforms_field_choices( $form_id, $field_id ) as $choice ) {
+		$value_normalized = strtolower( trim( $choice['value'] ) );
+		$label_normalized  = strtolower( trim( $choice['label'] ) );
+
+		if ( in_array( $value_normalized, $technician_keywords, true ) || in_array( $label_normalized, $technician_keywords, true ) ) {
+			$matches[] = $choice['value'];
+		}
+	}
+
+	return $matches;
+}
+
+/**
+ * The 20% platform fee notice + required "I agree" checkbox for the
+ * technician side of the registration form (WPForms form 8203 — see
+ * custom_truelysell_registration_handler()). This form isn't a theme
+ * template (WPForms renders it from its own saved definition, not any
+ * file in this theme), so it can't be edited directly — the notice and
+ * checkbox are added as plain HTML inside the existing <form> via JS,
+ * which is enough for them to submit as normal $_POST fields alongside
+ * WPForms' own fields.
+ *
+ * Field 1 is the same "register as a technician/customer" field
+ * custom_truelysell_registration_handler() already reads — its actual
+ * choice values (fetched from the form's own saved definition, not
+ * guessed) tell us exactly which selection means "technician", so the
+ * checkbox only appears/becomes required for that choice, never for a
+ * customer registering on the same form.
+ */
+add_action( 'wp_footer', 'custom_truelysell_render_technician_fee_agreement_notice' );
+function custom_truelysell_render_technician_fee_agreement_notice() {
+	$technician_values = custom_truelysell_get_wpforms_technician_choice_values( 8203, 1 );
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var form = document.getElementById('wpforms-form-8203');
+		if (!form) {
+			return;
+		}
+
+		var technicianValues = <?php echo wp_json_encode( array_map( 'strval', $technician_values ) ); ?>;
+		var roleInputs = form.querySelectorAll('input[name="wpforms[fields][1]"], select[name="wpforms[fields][1]"]');
+		if (!roleInputs.length) {
+			// This site's form doesn't expose field 1 the way this was built
+			// against — bail out rather than showing the notice to everyone
+			// regardless of role.
+			return;
+		}
+
+		var wrapper = document.createElement('div');
+		wrapper.className = 'wpforms-field truelysell-fee-agreement-field';
+		wrapper.style.display = 'none';
+		wrapper.innerHTML =
+			'<div class="alert alert-info" style="margin-bottom:10px;"><?php echo esc_js( __( 'A 20% platform fee is deducted from each completed service.', 'truelysell' ) ); ?></div>' +
+			'<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">' +
+				'<input type="checkbox" name="custom_truelysell_fee_agreement" value="1" id="custom-truelysell-fee-agreement-checkbox">' +
+				'<span><?php echo esc_js( __( 'I understand and agree that a 20% platform fee will be deducted from each completed service.', 'truelysell' ) ); ?></span>' +
+			'</label>';
+
+		var submitButton = form.querySelector('button[type="submit"], input[type="submit"]');
+		if (submitButton && submitButton.parentNode) {
+			submitButton.parentNode.insertBefore(wrapper, submitButton);
+		} else {
+			form.appendChild(wrapper);
+		}
+
+		var checkbox = wrapper.querySelector('#custom-truelysell-fee-agreement-checkbox');
+
+		function isTechnicianSelected() {
+			for (var i = 0; i < roleInputs.length; i++) {
+				var input = roleInputs[i];
+				// A <select> always has exactly one current value; a radio/
+				// checkbox only counts while actually checked.
+				var isActive = (input.tagName === 'SELECT') || input.checked;
+				if (isActive && technicianValues.indexOf(input.value) !== -1) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		function syncFeeAgreementVisibility() {
+			var show = isTechnicianSelected();
+			wrapper.style.display = show ? 'block' : 'none';
+			if (checkbox) {
+				checkbox.required = show;
+				if (!show) {
+					checkbox.checked = false;
+				}
+			}
+		}
+
+		roleInputs.forEach(function (input) {
+			input.addEventListener('change', syncFeeAgreementVisibility);
+		});
+		syncFeeAgreementVisibility();
+
+		// Defensive backstop alongside the checkbox's own native
+		// `required` attribute — matches the pattern used elsewhere in
+		// this theme for forms whose own JS submission handling can't be
+		// fully relied on to respect standard HTML5 validation.
+		form.addEventListener('submit', function (e) {
+			if (checkbox && checkbox.required && !checkbox.checked) {
+				e.preventDefault();
+				e.stopImmediatePropagation();
+				checkbox.focus();
+			}
+		}, true);
+	});
+	</script>
+	<?php
 }
 
 /**
@@ -2575,6 +2817,7 @@ function custom_truelysell_render_provider_services_card_inner( $user_id = 0 ) {
 											<i class="ti ti-map-pin me-2"></i><?php echo $location ? esc_html( $location ) : esc_html__( 'Location not added', 'truelysell' ); ?>
 										</p>
 										<h6 class="provider-service-price mb-0"><?php echo esc_html( custom_truelysell_format_listing_price( $listing_id ) ); ?> <?php echo custom_truelysell_get_listing_was_price_html( $listing_id ); ?></h6>
+										<span class="fs-12 text-muted d-block text-end"><?php echo esc_html( sprintf( __( 'TVs up to %d"', 'truelysell' ), TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES ) ); ?></span>
 									</div>
 									<?php if ( $is_own_listing ) : ?>
 										<div class="d-flex justify-content-between align-items-center gap-2 mt-3">
@@ -3076,6 +3319,7 @@ function custom_truelysell_inject_customer_booking_modal() {
 
     // Currency
     $currency_symbol = function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '$';
+    $listing_base_price = $listing_id ? custom_truelysell_get_listing_base_price( $listing_id ) : 0;
     ?>
     <style>
         /*
@@ -3153,6 +3397,45 @@ function custom_truelysell_inject_customer_booking_modal() {
                             <div class="row g-3 mb-3" id="service-providers-wrapper" style="display:none;">
                                 <div class="col-md-12" id="service-providers-list"></div>
                             </div>
+
+                            <div class="row g-3 mb-3">
+                                <div class="col-md-12">
+                                    <label class="form-label fw-medium"><?php esc_html_e( 'How many TVs need to be mounted?', 'truelysell' ); ?> <span class="text-danger">*</span></label>
+                                    <input type="number" name="tv_quantity" id="customer-tv-quantity" class="form-control" min="1" max="20" step="1" value="1" required>
+                                </div>
+                                <div class="col-md-12" id="customer-tv-sizes-container">
+                                    <!-- One "TV #N Size" field per TV, generated by JS below to match the quantity above — each TV can be a different size. -->
+                                </div>
+                                <div class="col-md-12">
+                                    <div class="fs-12 text-muted mt-1"><?php echo esc_html( sprintf( __( 'The listed price covers TVs up to %d". A %s%d surcharge is automatically added for each TV larger than that.', 'truelysell' ), TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES, $currency_symbol, TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE ) ); ?></div>
+                                </div>
+                            </div>
+
+                            <?php if ( $listing_base_price > 0 ) : ?>
+                            <div class="row g-3 mb-3">
+                                <div class="col-md-12">
+                                    <div class="alert alert-light border mb-0" id="customer-booking-price-summary">
+                                        <div class="d-flex justify-content-between">
+                                            <span><?php echo esc_html( sprintf( __( 'Service price (%s per TV)', 'truelysell' ), $currency_symbol . number_format( $listing_base_price, 2 ) ) ); ?></span>
+                                            <span id="customer-booking-price-base"><?php echo esc_html( $currency_symbol . number_format( $listing_base_price, 2 ) ); ?></span>
+                                        </div>
+                                        <div class="d-flex justify-content-between" id="customer-booking-price-surcharge-row" style="display:none !important;">
+                                            <span><?php echo esc_html( sprintf( __( 'Oversized TV surcharge (over %d")', 'truelysell' ), TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES ) ); ?></span>
+                                            <span id="customer-booking-price-surcharge">+<?php echo esc_html( $currency_symbol . number_format( TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE, 2 ) ); ?></span>
+                                        </div>
+                                        <hr class="my-2">
+                                        <div class="d-flex justify-content-between fw-medium">
+                                            <span><?php esc_html_e( 'Total service price', 'truelysell' ); ?></span>
+                                            <span id="customer-booking-price-total"><?php echo esc_html( $currency_symbol . number_format( $listing_base_price, 2 ) ); ?></span>
+                                        </div>
+                                        <div class="d-flex justify-content-between text-primary fw-bold">
+                                            <span><?php esc_html_e( 'Deposit due today (20%)', 'truelysell' ); ?></span>
+                                            <span id="customer-booking-price-deposit"><?php echo esc_html( $currency_symbol . number_format( $listing_base_price * 0.2, 2 ) ); ?></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <?php endif; ?>
 
                             <div class="row g-3 mb-3">
                                 <div class="col-md-6">
@@ -3594,6 +3877,116 @@ function custom_truelysell_inject_customer_booking_modal() {
             preferredTimeInput.addEventListener('change', customTruelysellCheckPreferredDateAvailability);
         }
 
+        // Live price summary — regenerates one size field per TV as the
+        // quantity changes, and recalculates the total/deposit from
+        // however many of those individual TVs are actually oversized,
+        // so the total shown always matches what the server will charge
+        // (each TV is priced on its own size, not one size for all of them).
+        (function () {
+            var basePrice        = <?php echo wp_json_encode( $listing_base_price ); ?>;
+            var threshold        = <?php echo wp_json_encode( TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES ); ?>;
+            var surchargePerTv   = <?php echo wp_json_encode( TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE ); ?>;
+            /*
+             * get_woocommerce_currency_symbol() returns an HTML entity
+             * string (e.g. "&#36;" for USD), meant for direct HTML output
+             * (where it correctly renders as "$") — but assigned as-is
+             * into JS and written via .textContent (which never parses
+             * HTML), it shows up as the literal text "&#36;". Decode it
+             * server-side first so the JS-side value is a plain character.
+             */
+            var currency         = <?php echo wp_json_encode( html_entity_decode( $currency_symbol, ENT_QUOTES ) ); ?>;
+            var tvQuantityInput  = document.getElementById('customer-tv-quantity');
+            var sizesContainer   = document.getElementById('customer-tv-sizes-container');
+            var surchargeRow     = document.getElementById('customer-booking-price-surcharge-row');
+            var surchargeLabelEl = surchargeRow ? surchargeRow.querySelector('span:first-child') : null;
+            var surchargeEl      = document.getElementById('customer-booking-price-surcharge');
+            var baseEl           = document.getElementById('customer-booking-price-base');
+            var totalEl          = document.getElementById('customer-booking-price-total');
+            var depositEl        = document.getElementById('customer-booking-price-deposit');
+
+            if (!tvQuantityInput || !sizesContainer || !totalEl || !depositEl || !basePrice) {
+                return;
+            }
+
+            function formatMoney(amount) {
+                return currency + amount.toFixed(2);
+            }
+
+            // Keeps whatever the customer already typed for TVs #1..N when
+            // the count changes — only adds/removes rows at the end,
+            // rather than wiping every field on every quantity change.
+            function renderSizeInputs() {
+                var quantity = parseInt(tvQuantityInput.value, 10);
+                if (isNaN(quantity) || quantity < 1) {
+                    quantity = 1;
+                }
+                quantity = Math.min(quantity, 20);
+
+                var existing = sizesContainer.querySelectorAll('.truelysell-tv-size-row');
+                for (var i = existing.length; i < quantity; i++) {
+                    var row = document.createElement('div');
+                    row.className = 'mb-2 truelysell-tv-size-row';
+                    row.innerHTML =
+                        '<label class="form-label fw-medium">' + <?php echo wp_json_encode( __( 'TV #', 'truelysell' ) ); ?> + (i + 1) + ' ' + <?php echo wp_json_encode( __( 'Size (inches)', 'truelysell' ) ); ?> + ' <span class="text-danger">*</span></label>' +
+                        '<input type="number" name="tv_sizes[]" class="form-control truelysell-tv-size-input" min="1" max="200" step="1" placeholder="<?php echo esc_js( __( 'e.g. 55', 'truelysell' ) ); ?>" required>';
+                    sizesContainer.appendChild(row);
+                    row.querySelector('.truelysell-tv-size-input').addEventListener('input', recalcPrice);
+                }
+                for (var j = existing.length - 1; j >= quantity; j--) {
+                    existing[j].remove();
+                }
+            }
+
+            function recalcPrice() {
+                var quantity = parseInt(tvQuantityInput.value, 10);
+                if (isNaN(quantity) || quantity < 1) {
+                    quantity = 1;
+                }
+
+                var oversizedCount = 0;
+                sizesContainer.querySelectorAll('.truelysell-tv-size-input').forEach(function (input) {
+                    var size = parseFloat(input.value);
+                    if (!isNaN(size) && size > threshold) {
+                        oversizedCount++;
+                    }
+                });
+
+                var surchargeTotal = oversizedCount * surchargePerTv;
+                var total = (basePrice * quantity) + surchargeTotal;
+
+                /*
+                 * A plain `.style.display = 'none'` here was silently
+                 * losing to this theme's `.d-flex` utility class, which
+                 * is itself !important-styled — so the row never actually
+                 * hid despite the JS logic running correctly. Setting it
+                 * with 'important' via setProperty() guarantees this wins
+                 * regardless of what any stylesheet rule does.
+                 */
+                if (surchargeRow) {
+                    surchargeRow.style.setProperty('display', oversizedCount > 0 ? 'flex' : 'none', 'important');
+                }
+                if (surchargeLabelEl) {
+                    surchargeLabelEl.textContent = oversizedCount + <?php echo wp_json_encode( ' ' . __( 'oversized TV(s) (over', 'truelysell' ) . ' ' ); ?> + threshold + '")';
+                }
+                if (surchargeEl) {
+                    surchargeEl.textContent = '+' + formatMoney(surchargeTotal);
+                }
+                if (baseEl) {
+                    baseEl.textContent = formatMoney(basePrice * quantity);
+                }
+                totalEl.textContent = formatMoney(total);
+                depositEl.textContent = formatMoney(total * 0.2);
+            }
+
+            tvQuantityInput.addEventListener('input', function () {
+                renderSizeInputs();
+                recalcPrice();
+            });
+
+            renderSizeInputs();
+            recalcPrice();
+        })();
+
         // Form submission
         if (bookingForm) {
             bookingForm.addEventListener('submit', function(e) {
@@ -3604,6 +3997,19 @@ function custom_truelysell_inject_customer_booking_modal() {
 
                 if (!listingId || listingId === '0') {
                     if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-danger mt-2">Could not identify the service. Please refresh and try again.</div>';
+                    return;
+                }
+
+                var tvQuantityVal = document.getElementById('customer-tv-quantity').value;
+                var tvSizeInputs  = document.querySelectorAll('.truelysell-tv-size-input');
+                var allSizesValid = tvSizeInputs.length > 0;
+                tvSizeInputs.forEach(function (input) {
+                    if (!input.value || parseFloat(input.value) <= 0) {
+                        allSizesValid = false;
+                    }
+                });
+                if (!tvQuantityVal || parseInt(tvQuantityVal, 10) < 1 || tvSizeInputs.length !== parseInt(tvQuantityVal, 10) || !allSizesValid) {
+                    if (responseMsg) responseMsg.innerHTML = '<div class="alert alert-warning mt-2">Please enter how many TVs need to be mounted and the size of each one.</div>';
                     return;
                 }
 
@@ -3957,6 +4363,13 @@ function custom_truelysell_ajax_book_service() {
     $phone        = sanitize_text_field( $_POST['phone'] ?? '' );
     $message      = sanitize_textarea_field( $_POST['message'] ?? '' );
     $customer_address = sanitize_text_field( $_POST['customer_address'] ?? '' );
+    $tv_quantity  = absint( $_POST['tv_quantity'] ?? 0 );
+    // One size per TV — array_map/array_filter here rather than trusting
+    // the client's array shape or length as-is.
+    $tv_sizes_raw = isset( $_POST['tv_sizes'] ) && is_array( $_POST['tv_sizes'] ) ? $_POST['tv_sizes'] : array();
+    $tv_sizes     = array_values( array_filter( array_map( 'floatval', $tv_sizes_raw ), function( $size ) {
+        return $size > 0;
+    } ) );
 
     /*
      * Required so the provider always has a starting point to plan
@@ -3978,6 +4391,12 @@ function custom_truelysell_ajax_book_service() {
     }
     if ( ! $preferred_date || ! $preferred_time ) {
         wp_send_json_error( 'Please select a preferred date and time.' );
+    }
+    if ( $tv_quantity < 1 ) {
+        wp_send_json_error( 'Please enter how many TVs need to be mounted.' );
+    }
+    if ( count( $tv_sizes ) !== $tv_quantity ) {
+        wp_send_json_error( 'Please enter a size for each TV.' );
     }
 
     $listing_post = get_post( $listing_id );
@@ -4059,11 +4478,14 @@ function custom_truelysell_ajax_book_service() {
     // Get product ID linked to this listing
     $product_id = get_post_meta( $listing_id, '_product_id', true );
 
-    // Get normal price
-    $normal_price = (float) get_post_meta( $listing_id, '_normal_price', true );
-    if ( ! $normal_price ) {
-        $normal_price = (float) get_post_meta( $listing_id, '_price', true );
-    }
+    // Base price × quantity, plus one surcharge for every individual TV
+    // that's actually oversized — each TV is priced on its own size, not
+    // a single size applied to all of them.
+    $base_price       = custom_truelysell_get_listing_base_price( $listing_id );
+    $oversized_count  = count( array_filter( $tv_sizes, function( $size ) {
+        return $size > TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES;
+    } ) );
+    $normal_price     = ( $base_price * $tv_quantity ) + ( $oversized_count * TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE );
 
     if ( ! $product_id || ! $normal_price || ! function_exists( 'wc_create_order' ) ) {
         wp_send_json_error( 'Online payment is not available for this service yet. Please contact us directly.' );
@@ -4084,7 +4506,15 @@ function custom_truelysell_ajax_book_service() {
     $args['totals']['total']    = $deposit_amount;
 
     $order   = wc_create_order();
-    $item_id = $order->add_product( wc_get_product( $product_id ), 1, $args );
+    /*
+     * Quantity is the actual TV count, not hardcoded 1 — $args['totals']
+     * above already carries the correct, already-multiplied deposit
+     * amount for that quantity (WooCommerce uses the explicit totals
+     * as-is here, it doesn't multiply them again by quantity), so this
+     * only fixes the displayed "Qty" column to match what the customer
+     * actually entered — it doesn't change the amount charged.
+     */
+    $item_id = $order->add_product( wc_get_product( $product_id ), $tv_quantity, $args );
     $item    = $item_id ? $order->get_item( $item_id ) : null;
     if ( $item ) {
         /*
@@ -4096,7 +4526,25 @@ function custom_truelysell_ajax_book_service() {
          * as checkout displaying a completely unrelated service's name.
          * The listing's own title is always correct, so use that instead.
          */
-        $item->set_name( get_the_title( $listing_id ) . ' — 20% Booking Deposit' );
+        /*
+         * Kept short and on one line deliberately — the checkout/pay page
+         * template (woocommerce/checkout/form-pay.php) has no word-wrap or
+         * horizontal scroll on its items table, so an overly long name
+         * here forces the table wider than the viewport and pushes the
+         * Subtotal/Total column off-screen.
+         */
+        $item_name = get_the_title( $listing_id ) . ' — 20% Deposit';
+        $details   = array();
+        if ( $tv_quantity > 1 ) {
+            $details[] = $tv_quantity . ' TVs';
+        }
+        if ( $oversized_count > 0 ) {
+            $details[] = sprintf( '%d oversized (+%s ea)', $oversized_count, wp_strip_all_tags( wc_price( TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE ) ) );
+        }
+        if ( $details ) {
+            $item_name .= ' (' . implode( ', ', $details ) . ')';
+        }
+        $item->set_name( $item_name );
         $item->save();
     }
 
@@ -4135,6 +4583,10 @@ function custom_truelysell_ajax_book_service() {
     $order->update_meta_data( '_truelysell_preferred_time', $preferred_time );
     $order->update_meta_data( '_truelysell_full_price', $normal_price );
     $order->update_meta_data( '_truelysell_deposit_amount', $deposit_amount );
+    $order->update_meta_data( '_truelysell_tv_quantity', $tv_quantity );
+    $order->update_meta_data( '_truelysell_tv_sizes', implode( ',', $tv_sizes ) );
+    $order->update_meta_data( '_truelysell_tv_oversized_count', $oversized_count );
+    $order->update_meta_data( '_truelysell_oversize_tv_surcharge', $oversized_count * TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE );
 
     $order->calculate_totals();
     $order->save();
@@ -4219,6 +4671,10 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
     $preferred_time = $order->get_meta( '_truelysell_preferred_time' );
     $full_price     = (float) $order->get_meta( '_truelysell_full_price' );
     $deposit_amount = (float) $order->get_meta( '_truelysell_deposit_amount' );
+    $tv_quantity    = absint( $order->get_meta( '_truelysell_tv_quantity' ) );
+    $tv_sizes       = array_filter( array_map( 'floatval', explode( ',', (string) $order->get_meta( '_truelysell_tv_sizes' ) ) ) );
+    $oversized_count = absint( $order->get_meta( '_truelysell_tv_oversized_count' ) );
+    $oversize_surcharge = (float) $order->get_meta( '_truelysell_oversize_tv_surcharge' );
 
     if ( ! $listing_id || ! $owner_id || ! $user_id ) {
         $order->add_order_note( sprintf(
@@ -4240,6 +4696,10 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
             'preferred_time' => $preferred_time,
             'deposit_paid'   => $deposit_amount,
             'total_price'    => $full_price,
+            'tv_quantity'    => $tv_quantity,
+            'tv_sizes'       => $tv_sizes,
+            'oversized_count' => $oversized_count,
+            'oversize_tv_surcharge' => $oversize_surcharge,
             'address'        => array(
                 'billing_address_1' => $customer_address,
                 'billing_city'      => '',
@@ -4329,6 +4789,8 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
             'preferred_time'   => $preferred_time,
             'full_price'       => $full_price,
             'deposit_amount'   => $deposit_amount,
+            'tv_quantity'      => $tv_quantity,
+            'tv_sizes'         => implode( ',', $tv_sizes ),
         )
     );
 
@@ -4344,26 +4806,79 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
         $preferred_text = 'Not specified';
     }
 
+    $tv_sizes_display = implode( '", ', array_map( function( $size ) {
+        return rtrim( rtrim( number_format( $size, 1 ), '0' ), '.' );
+    }, $tv_sizes ) ) . '"';
+    $tv_details_text = sprintf( '%d TV(s): %s', $tv_quantity, $tv_sizes_display );
+    if ( $oversize_surcharge > 0 ) {
+        $tv_details_text .= sprintf( ' (%d oversized, includes %s surcharge)', $oversized_count, wp_strip_all_tags( wc_price( $oversize_surcharge ) ) );
+    }
+
+    /*
+     * The theme has fully configurable "Booking paid notification to
+     * owner" / "Booking paid confirmation to user" email templates
+     * (Theme Options — see inc/options-init.php), but like the Welcome
+     * Email, nothing wires them up on this site since bookings are
+     * created by this custom deposit flow, not the plugin's own native
+     * booking code. If the admin has enabled + written one of these,
+     * use it (with its own documented tags); otherwise fall back to the
+     * plain-text email this already sent before, so nothing regresses
+     * for an admin who's never touched these settings.
+     */
+    $email_tags = array(
+        '{user_mail}'      => $email,
+        '{user_name}'      => trim( $first_name . ' ' . $last_name ),
+        '{booking_date}'   => $preferred_text,
+        '{dates}'          => $preferred_text,
+        '{listing_name}'   => get_the_title( $listing_id ),
+        '{listing_url}'    => get_permalink( $listing_id ),
+        '{listing_address}' => function_exists( 'custom_truelysell_get_listing_location_text' ) ? custom_truelysell_get_listing_location_text( $listing_id ) : '',
+        '{site_name}'      => get_bloginfo( 'name' ),
+        '{site_link}'      => home_url(),
+        '{details}'        => $tv_details_text,
+        '{payment_url}'    => '',
+        '{expiration}'     => '',
+    );
+
     // Notify the owner/technician
     $owner_info = get_userdata( $owner_id );
     if ( $owner_info && is_email( $owner_info->user_email ) ) {
-        $subject = sprintf( __( 'New Booking (Deposit Paid): %s', 'truelysell' ), get_the_title( $listing_id ) );
-        $body    = sprintf(
-            "A new booking has been made and the 20%% deposit has been paid.\n\nService: %s\nCustomer: %s %s (%s)\nPhone: %s\nService Address: %s\nPreferred Date/Time: %s\nMessage: %s\n\nDeposit Paid: %s\nRemaining Balance (collect from customer): %s\n\nPlease contact the customer to confirm or adjust the time.\n\nBooking ID: #%d",
+        $owner_tags = $email_tags;
+        $owner_tags['{listing_phone}'] = get_user_meta( $owner_id, 'phone', true );
+        $owner_tags['{listing_email}'] = $owner_info->user_email;
+
+        $fallback_subject = sprintf( __( 'New Booking (Deposit Paid): %s', 'truelysell' ), get_the_title( $listing_id ) );
+        $fallback_body    = sprintf(
+            "A new booking has been made and the 20%% deposit has been paid.\n\nService: %s\nTVs: %s\nCustomer: %s %s (%s)\nPhone: %s\nService Address: %s\nPreferred Date/Time: %s\nMessage: %s\n\nDeposit Paid: %s\nRemaining Balance (collect from customer): %s\n\nPlease contact the customer to confirm or adjust the time.\n\nBooking ID: #%d",
             get_the_title( $listing_id ),
+            $tv_details_text,
             $first_name, $last_name, $email,
             $phone, ( $customer_address ?: 'Not provided' ), $preferred_text, $message,
             wp_strip_all_tags( wc_price( $deposit_amount ) ), wp_strip_all_tags( wc_price( $remaining_balance ) ),
             $booking_id
         );
-        wp_mail( $owner_info->user_email, $subject, $body );
+
+        custom_truelysell_send_booking_email_with_theme_override(
+            $owner_info->user_email,
+            'paid_booking_confirmation',
+            'paid_booking_confirmation_email_subject',
+            'paid_booking_confirmation_email_content',
+            $owner_tags,
+            $fallback_subject,
+            $fallback_body
+        );
     }
 
     // Confirmation to the customer
     if ( is_email( $email ) ) {
         $technician_name = $owner_info ? $owner_info->display_name : __( 'a technician', 'truelysell' );
-        $subject = sprintf( __( 'Booking Confirmation: %s', 'truelysell' ), get_the_title( $listing_id ) );
-        $body    = sprintf(
+
+        $customer_tags = $email_tags;
+        $customer_tags['{listing_phone}'] = $owner_info ? get_user_meta( $owner_id, 'phone', true ) : '';
+        $customer_tags['{listing_email}'] = $owner_info ? $owner_info->user_email : '';
+
+        $fallback_subject = sprintf( __( 'Booking Confirmation: %s', 'truelysell' ), get_the_title( $listing_id ) );
+        $fallback_body    = sprintf(
             "Thank you for your booking!\n\nService: %s\nTechnician: %s\nPreferred Date/Time: %s\nDeposit Paid: %s\nRemaining Balance Due: %s\n\nBooking ID: #%d\n\n%s will contact you shortly to confirm the time.",
             get_the_title( $listing_id ),
             $technician_name,
@@ -4372,8 +4887,43 @@ function custom_truelysell_finalize_deposit_booking( $order_id, $trigger ) {
             $booking_id,
             $technician_name
         );
-        wp_mail( $email, $subject, $body );
+
+        custom_truelysell_send_booking_email_with_theme_override(
+            $email,
+            'user_paid_booking_confirmation',
+            'user_paid_booking_confirmation_email_subject',
+            'user_paid_booking_confirmation_email_content',
+            $customer_tags,
+            $fallback_subject,
+            $fallback_body
+        );
     }
+}
+
+/**
+ * Sends to $to using the theme's own configured Theme Options email
+ * template (identified by its enable/subject/content option IDs — see
+ * inc/options-init.php) when the admin has actually turned it on and
+ * written both a subject and content; otherwise sends the given plain
+ * fallback instead, so a booking notification is always sent even if
+ * the admin has never touched these settings.
+ */
+function custom_truelysell_send_booking_email_with_theme_override( $to, $enable_option_id, $subject_option_id, $content_option_id, $tags, $fallback_subject, $fallback_body ) {
+    $enabled            = function_exists( 'truelysell_fl_framework_getoptions' ) && truelysell_fl_framework_getoptions( $enable_option_id );
+    $configured_subject = $enabled ? truelysell_fl_framework_getoptions( $subject_option_id ) : '';
+    $configured_content = $enabled ? truelysell_fl_framework_getoptions( $content_option_id ) : '';
+
+    if ( $configured_subject && $configured_content ) {
+        wp_mail(
+            $to,
+            strtr( $configured_subject, $tags ),
+            strtr( $configured_content, $tags ),
+            array( 'Content-Type: text/html; charset=UTF-8' )
+        );
+        return;
+    }
+
+    wp_mail( $to, $fallback_subject, $fallback_body );
 }
 
 /**
@@ -4515,6 +5065,52 @@ if ( ! function_exists( 'truelysell_get_booking_job_completion_state' ) ) {
 }
 
 /**
+ * The booking's `comment` column is a serialize()'d array written by
+ * custom_truelysell_finalize_deposit_booking() above, with shape
+ * ['customer_details' => ['message' => ..., 'deposit_paid' => ...,
+ * 'tv_quantity' => ..., 'tv_sizes' => [...], ...]]. Decode it defensively —
+ * older/plugin-native rows may have a different shape or not be
+ * serialized at all. Defined here (not inc/template-tags.php, even
+ * though the provider/customer bookings shortcodes that call it live
+ * there) for the same one-file-to-upload reason as the function above.
+ */
+if ( ! function_exists( 'truelysell_get_booking_customer_details' ) ) {
+	function truelysell_get_booking_customer_details( $booking ) {
+		if ( empty( $booking->comment ) || ! is_serialized( $booking->comment ) ) {
+			return array();
+		}
+
+		$data = @unserialize( $booking->comment, array( 'allowed_classes' => false ) );
+
+		return ( is_array( $data ) && ! empty( $data['customer_details'] ) && is_array( $data['customer_details'] ) )
+			? $data['customer_details']
+			: array();
+	}
+}
+
+/**
+ * "2 TV(s): 50", 75"" — or '' if this booking has no per-TV size data
+ * (e.g. it predates this feature, or isn't a deposit-flow booking at
+ * all). Shared by every place that displays a booking's TV details.
+ */
+if ( ! function_exists( 'truelysell_format_booking_tv_details' ) ) {
+	function truelysell_format_booking_tv_details( $customer_details ) {
+		$quantity = ! empty( $customer_details['tv_quantity'] ) ? absint( $customer_details['tv_quantity'] ) : 0;
+		$sizes    = ! empty( $customer_details['tv_sizes'] ) && is_array( $customer_details['tv_sizes'] ) ? $customer_details['tv_sizes'] : array();
+
+		if ( ! $quantity || empty( $sizes ) ) {
+			return '';
+		}
+
+		$sizes_text = implode( '", ', array_map( function( $size ) {
+			return rtrim( rtrim( number_format( (float) $size, 1 ), '0' ), '.' );
+		}, $sizes ) ) . '"';
+
+		return sprintf( '%d TV(s): %s', $quantity, $sizes_text );
+	}
+}
+
+/**
  * Same booking-row -> order resolution every one of these handlers
  * needs: load the booking, confirm the deposit was actually finalized
  * (booking_created meta), and load the order it belongs to.
@@ -4638,6 +5234,85 @@ function custom_truelysell_ajax_confirm_job_complete() {
 	) );
 }
 
+/**
+ * Creates (or reuses an existing unpaid) remaining-balance order for a
+ * booking whose deposit order + booking row are already known — shared
+ * by the customer-facing "Pay Remaining Balance" AJAX handler below AND
+ * the admin testing tool further down, so there's exactly one place that
+ * knows how to build this order correctly.
+ *
+ * @param WC_Order $order       The original deposit order.
+ * @param object   $booking     The bookings_calendar row.
+ * @param int      $customer_id Who the WC order's customer should be —
+ *                               the real customer normally, but the admin
+ *                               tool passes its own ID since it's building
+ *                               this on the customer's behalf for testing.
+ * @return WC_Order|WP_Error
+ */
+function custom_truelysell_create_or_reuse_remaining_balance_order( $order, $booking, $customer_id ) {
+	$state = custom_truelysell_get_job_completion_state( $order );
+
+	if ( $state['remaining_order_id'] ) {
+		$existing_remaining_order = wc_get_order( $state['remaining_order_id'] );
+		if ( $existing_remaining_order && ! $existing_remaining_order->is_paid() && 'cancelled' !== $existing_remaining_order->get_status() ) {
+			return $existing_remaining_order;
+		}
+	}
+
+	$listing_id       = absint( $order->get_meta( '_truelysell_listing_id' ) );
+	$product_id       = get_post_meta( $listing_id, '_product_id', true );
+	$remaining_amount = $state['remaining_amount'];
+
+	if ( ! $product_id || $remaining_amount <= 0 || ! function_exists( 'wc_create_order' ) ) {
+		return new WP_Error( 'truelysell_remaining_order_failed', __( 'Unable to create the remaining-balance payment right now.', 'truelysell' ) );
+	}
+
+	$args                       = array();
+	$args['totals']['subtotal'] = $remaining_amount;
+	$args['totals']['total']    = $remaining_amount;
+
+	// Same TV quantity as the original deposit order, for a consistent
+	// "Qty" display — $args['totals'] above is already the correct
+	// already-multiplied remaining amount, so this doesn't change it.
+	$tv_quantity_for_line = max( 1, absint( $order->get_meta( '_truelysell_tv_quantity' ) ) );
+
+	$remaining_order = wc_create_order();
+	$item_id         = $remaining_order->add_product( wc_get_product( $product_id ), $tv_quantity_for_line, $args );
+	$item            = $item_id ? $remaining_order->get_item( $item_id ) : null;
+	if ( $item ) {
+		$item->set_name( get_the_title( $listing_id ) . ' — ' . __( 'Remaining Balance', 'truelysell' ) );
+		$item->save();
+	}
+
+	$address = array(
+		'first_name' => $order->get_meta( '_truelysell_first_name' ),
+		'last_name'  => $order->get_meta( '_truelysell_last_name' ),
+		'email'      => $order->get_meta( '_truelysell_email' ),
+		'phone'      => $order->get_meta( '_truelysell_phone' ),
+		'country'    => $order->get_billing_country(),
+		'address_1'  => $order->get_meta( '_truelysell_customer_address' ),
+	);
+	$remaining_order->set_address( $address, 'billing' );
+	$remaining_order->set_address( $address, 'shipping' );
+	$remaining_order->set_customer_id( $customer_id );
+	$remaining_order->set_billing_email( $address['email'] );
+
+	// Links back to the original deposit order/booking so the payment-
+	// complete hook below knows exactly what this order is settling.
+	$remaining_order->update_meta_data( '_truelysell_remaining_of_order_id', $order->get_id() );
+	$remaining_order->update_meta_data( '_truelysell_booking_id', $booking->ID );
+	$remaining_order->update_meta_data( '_truelysell_listing_id', $listing_id );
+	$remaining_order->update_meta_data( '_truelysell_owner_id', $booking->owner_id );
+	$remaining_order->calculate_totals();
+	$remaining_order->save();
+
+	$order->update_meta_data( '_truelysell_remaining_order_id', $remaining_order->get_id() );
+	$order->save_meta_data();
+	$order->add_order_note( sprintf( 'Truelysell: remaining-balance order #%d created.', $remaining_order->get_id() ) );
+
+	return $remaining_order;
+}
+
 add_action( 'wp_ajax_truelysell_pay_remaining_balance', 'custom_truelysell_ajax_pay_remaining_balance' );
 function custom_truelysell_ajax_pay_remaining_balance() {
 	if ( ! check_ajax_referer( 'truelysell_job_completion_nonce', 'nonce', false ) ) {
@@ -4665,63 +5340,95 @@ function custom_truelysell_ajax_pay_remaining_balance() {
 		wp_send_json_error( 'This booking is already fully settled.' );
 	}
 
-	// Idempotent: reuse an existing unpaid/pending remaining-balance order
-	// rather than creating a fresh one every time this is clicked (e.g. the
-	// customer navigates back to it, or double-clicks).
-	if ( $state['remaining_order_id'] ) {
-		$existing_remaining_order = wc_get_order( $state['remaining_order_id'] );
-		if ( $existing_remaining_order && ! $existing_remaining_order->is_paid() && 'cancelled' !== $existing_remaining_order->get_status() ) {
-			wp_send_json_success( array( 'redirect_url' => $existing_remaining_order->get_checkout_payment_url() ) );
-		}
+	$remaining_order = custom_truelysell_create_or_reuse_remaining_balance_order( $order, $booking, get_current_user_id() );
+	if ( is_wp_error( $remaining_order ) ) {
+		wp_send_json_error( $remaining_order->get_error_message() );
 	}
-
-	$listing_id     = absint( $order->get_meta( '_truelysell_listing_id' ) );
-	$product_id     = get_post_meta( $listing_id, '_product_id', true );
-	$remaining_amount = $state['remaining_amount'];
-
-	if ( ! $product_id || $remaining_amount <= 0 || ! function_exists( 'wc_create_order' ) ) {
-		wp_send_json_error( 'Unable to create the remaining-balance payment right now. Please contact us.' );
-	}
-
-	$args                        = array();
-	$args['totals']['subtotal']  = $remaining_amount;
-	$args['totals']['total']     = $remaining_amount;
-
-	$remaining_order = wc_create_order();
-	$item_id         = $remaining_order->add_product( wc_get_product( $product_id ), 1, $args );
-	$item            = $item_id ? $remaining_order->get_item( $item_id ) : null;
-	if ( $item ) {
-		$item->set_name( get_the_title( $listing_id ) . ' — ' . __( 'Remaining Balance', 'truelysell' ) );
-		$item->save();
-	}
-
-	$address = array(
-		'first_name' => $order->get_meta( '_truelysell_first_name' ),
-		'last_name'  => $order->get_meta( '_truelysell_last_name' ),
-		'email'      => $order->get_meta( '_truelysell_email' ),
-		'phone'      => $order->get_meta( '_truelysell_phone' ),
-		'country'    => $order->get_billing_country(),
-		'address_1'  => $order->get_meta( '_truelysell_customer_address' ),
-	);
-	$remaining_order->set_address( $address, 'billing' );
-	$remaining_order->set_address( $address, 'shipping' );
-	$remaining_order->set_customer_id( get_current_user_id() );
-	$remaining_order->set_billing_email( $address['email'] );
-
-	// Links back to the original deposit order/booking so the payment-
-	// complete hook below knows exactly what this order is settling.
-	$remaining_order->update_meta_data( '_truelysell_remaining_of_order_id', $order->get_id() );
-	$remaining_order->update_meta_data( '_truelysell_booking_id', $booking_id );
-	$remaining_order->update_meta_data( '_truelysell_listing_id', $listing_id );
-	$remaining_order->update_meta_data( '_truelysell_owner_id', $booking->owner_id );
-	$remaining_order->calculate_totals();
-	$remaining_order->save();
-
-	$order->update_meta_data( '_truelysell_remaining_order_id', $remaining_order->get_id() );
-	$order->save_meta_data();
-	$order->add_order_note( sprintf( 'Truelysell: remaining-balance order #%d created for customer to pay online.', $remaining_order->get_id() ) );
 
 	wp_send_json_success( array( 'redirect_url' => $remaining_order->get_checkout_payment_url() ) );
+}
+
+// ============================================================
+// ADMIN TESTING TOOL — force-test the remaining-balance payment flow on
+// a past/already-finalized booking, without needing two real accounts
+// (technician + customer) to actually click "Mark Job Complete" /
+// "Confirm Job Complete" themselves first.
+// ------------------------------------------------------------------
+// The normal flow (mutual technician+customer confirmation, see the
+// REMAINING BALANCE section above) has no date restriction at all — a
+// past appointment already works exactly the same as a future one for
+// this purpose, there's nothing to "unlock". What's actually missing
+// for testing is a way for admin to trigger both confirmations AND get
+// a payable link themselves, without waiting on two other real people.
+// This adds exactly that, scoped to administrators only, as a WooCommerce
+// order action (Orders → open the deposit order → Order actions dropdown)
+// — never exposed anywhere a technician or customer could reach it, and
+// it doesn't change how the real flow behaves for them.
+// ============================================================
+
+add_filter( 'woocommerce_order_actions', 'custom_truelysell_add_admin_test_remaining_payment_action' );
+function custom_truelysell_add_admin_test_remaining_payment_action( $actions ) {
+	global $theorder;
+
+	if ( ! current_user_can( 'manage_options' ) || ! $theorder || ! $theorder->get_meta( '_truelysell_booking_created' ) ) {
+		return $actions;
+	}
+
+	$booking_id = absint( $theorder->get_meta( 'booking_id' ) );
+	$booking    = $booking_id && function_exists( 'custom_truelysell_get_booking_by_id' ) ? custom_truelysell_get_booking_by_id( $booking_id ) : null;
+	if ( ! $booking ) {
+		return $actions;
+	}
+
+	$state = custom_truelysell_get_job_completion_state( $theorder );
+	if ( $state['remaining_settled'] ) {
+		return $actions;
+	}
+
+	$actions['truelysell_admin_test_remaining_payment'] = __( 'Truelysell: force-confirm & get remaining-balance payment link (testing)', 'truelysell' );
+
+	return $actions;
+}
+
+add_action( 'woocommerce_order_action_truelysell_admin_test_remaining_payment', 'custom_truelysell_handle_admin_test_remaining_payment' );
+function custom_truelysell_handle_admin_test_remaining_payment( $order ) {
+	if ( ! current_user_can( 'manage_options' ) || ! $order->get_meta( '_truelysell_booking_created' ) ) {
+		return;
+	}
+
+	$booking_id = absint( $order->get_meta( 'booking_id' ) );
+	$booking    = $booking_id && function_exists( 'custom_truelysell_get_booking_by_id' ) ? custom_truelysell_get_booking_by_id( $booking_id ) : null;
+	if ( ! $booking ) {
+		$order->add_order_note( 'Truelysell (admin test): could not find this order\'s booking row — nothing to do.' );
+		return;
+	}
+
+	// Force both confirmation flags — this is the ONLY place in the
+	// codebase that sets them without the technician/customer actually
+	// clicking their own button, and it's gated to manage_options above.
+	$order->update_meta_data( '_truelysell_job_marked_complete_by_technician', 1 );
+	$order->update_meta_data( '_truelysell_job_marked_complete_by_technician_time', current_time( 'mysql' ) );
+	$order->update_meta_data( '_truelysell_job_confirmed_complete_by_customer', 1 );
+	$order->update_meta_data( '_truelysell_job_confirmed_complete_by_customer_time', current_time( 'mysql' ) );
+	$order->save_meta_data();
+	$order->add_order_note( 'Truelysell (admin test): force-confirmed both sides so the remaining-balance payment can be tested.' );
+
+	// Build the order as the actual customer (so its billing details and
+	// "who owns this order" stay correct) — admin just opens the link
+	// themselves to test checkout, they don't have to actually be that
+	// customer's account.
+	$customer_id     = absint( $order->get_meta( '_truelysell_customer_id' ) );
+	$remaining_order = custom_truelysell_create_or_reuse_remaining_balance_order( $order, $booking, $customer_id ?: get_current_user_id() );
+
+	if ( is_wp_error( $remaining_order ) ) {
+		$order->add_order_note( 'Truelysell (admin test): failed to create remaining-balance order — ' . $remaining_order->get_error_message() );
+		return;
+	}
+
+	$order->add_order_note( sprintf(
+		'Truelysell (admin test): remaining-balance payment link ready — %s',
+		esc_url( $remaining_order->get_checkout_payment_url() )
+	) );
 }
 
 /**
@@ -4934,6 +5641,7 @@ function custom_truelysell_render_job_completion_dashboard_widget_buttons() {
 		if ( null === $state || $state['remaining_settled'] ) {
 			continue; // Nothing actionable to inject for this row.
 		}
+		$customer_details = function_exists( 'truelysell_get_booking_customer_details' ) ? truelysell_get_booking_customer_details( $booking ) : array();
 		$rows[ absint( $booking->ID ) ] = array(
 			'technician_marked_complete' => $state['technician_marked_complete'],
 			'both_confirmed'             => $state['both_confirmed'],
@@ -4942,6 +5650,8 @@ function custom_truelysell_render_job_completion_dashboard_widget_buttons() {
 			// price (e.g. "$120.00") with no indication that only the 20%
 			// deposit has actually cleared — easy to misread as fully paid.
 			'deposit_amount'             => round( (float) $booking->price - $state['remaining_amount'], 2 ),
+			'tv_quantity'                => ! empty( $customer_details['tv_quantity'] ) ? absint( $customer_details['tv_quantity'] ) : 0,
+			'tv_sizes'                   => ! empty( $customer_details['tv_sizes'] ) && is_array( $customer_details['tv_sizes'] ) ? implode( '", ', array_map( 'floatval', $customer_details['tv_sizes'] ) ) . '"' : '',
 		);
 	}
 
@@ -4953,7 +5663,10 @@ function custom_truelysell_render_job_completion_dashboard_widget_buttons() {
 	document.addEventListener('DOMContentLoaded', function () {
 		var rows          = <?php echo wp_json_encode( $rows ); ?>;
 		var isProvider    = <?php echo wp_json_encode( $is_provider ); ?>;
-		var currencySymbol = <?php echo wp_json_encode( function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '$' ); ?>;
+		// html_entity_decode() because get_woocommerce_currency_symbol() returns
+		// an HTML entity string (e.g. "&#36;") meant for direct HTML output —
+		// used as plain JS text via .textContent, it would show up literally.
+		var currencySymbol = <?php echo wp_json_encode( html_entity_decode( function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '$', ENT_QUOTES ) ); ?>;
 
 		Object.keys(rows).forEach(function (bookingId) {
 			var info = rows[bookingId];
@@ -4977,6 +5690,22 @@ function custom_truelysell_render_job_completion_dashboard_widget_buttons() {
 				note.className = 'truelysell-deposit-note fs-12 text-muted ms-2';
 				note.textContent = '(' + <?php echo wp_json_encode( __( 'Deposit paid:', 'truelysell' ) ); ?> + ' ' + currencySymbol + info.deposit_amount.toFixed(2) + <?php echo wp_json_encode( __( ' • Remaining:', 'truelysell' ) ); ?> + ' ' + currencySymbol + info.remaining_amount.toFixed(2) + ')';
 				amountLi.appendChild(note);
+			}
+
+			if (amountLi && info.tv_quantity && info.tv_sizes && !row.querySelector('.truelysell-tv-details-li')) {
+				var tvLi = document.createElement('li');
+				tvLi.className = 'd-flex align-items-center mb-2 truelysell-tv-details-li';
+				var tvLabel = document.createElement('span');
+				tvLabel.className = 'book-item';
+				tvLabel.textContent = <?php echo wp_json_encode( __( 'TVs', 'truelysell' ) ); ?>;
+				var tvSep = document.createElement('small');
+				tvSep.className = 'me-2';
+				tvSep.textContent = ': ';
+				var tvText = document.createTextNode(info.tv_quantity + ' (' + info.tv_sizes + ')');
+				tvLi.appendChild(tvLabel);
+				tvLi.appendChild(tvSep);
+				tvLi.appendChild(tvText);
+				amountLi.parentNode.insertBefore(tvLi, amountLi.nextSibling);
 			}
 
 			var actionsRow = row.querySelector('.d-flex.align-items-center.flex-wrap.row-gap-2');
@@ -5521,6 +6250,980 @@ function custom_enforce_phone_required_js() {
     });
     </script>
     <?php
+}
+
+// ============================================================
+// PAYOUT METHOD SYSTEM — Bank Account, Stripe & PayPal
+// ------------------------------------------------------------------
+// Full payout method integration: status tracking, secure masked
+// display, change-method confirmation flow, admin columns, payout
+// guard, and dedicated admin management page.
+//
+// Data stored per technician (user meta):
+//   truelysell_payout_method        — 'paypal' | 'stripe' | 'bank'
+//   truelysell_payout_status        — 'connected' | 'pending' | 'not_connected' | 'disconnected'
+//   truelysell_payout_connected_date — Unix timestamp of first connection
+//   truelysell_payout_account_label — Masked safe-display label (never raw credentials)
+//   truelysell_paypal_payout_email  — PayPal email (managed by plugin's own handler)
+//   truelysell_stripe_email         — Stripe email / account ID
+//   truelysell_bank_account_holder  — Bank account holder name
+//   truelysell_bank_name            — Bank name
+//   truelysell_bank_account_number  — Account number (masked on display)
+//   truelysell_bank_routing_number  — Routing number (masked on display)
+// ============================================================
+
+/**
+ * Mask an email address for safe display.
+ * Shows first 2 chars + ●●● + @domain — never the full address.
+ */
+function custom_truelysell_mask_payout_email( $email ) {
+	if ( ! $email ) {
+		return '';
+	}
+	$parts        = explode( '@', $email, 2 );
+	$local        = $parts[0];
+	$domain       = isset( $parts[1] ) ? $parts[1] : '';
+	$masked_local = strlen( $local ) > 2 ? substr( $local, 0, 2 ) . '●●●' : '●●●';
+	return $masked_local . ( $domain ? '@' . $domain : '' );
+}
+
+/**
+ * Mask a bank account or routing number for safe display.
+ * Shows ●●●● + last 4 digits only.
+ */
+function custom_truelysell_mask_account_number( $number ) {
+	$digits = preg_replace( '/\D/', '', (string) $number );
+	if ( ! $digits ) {
+		return '';
+	}
+	if ( strlen( $digits ) < 4 ) {
+		return '●●●●';
+	}
+	return '●●●●' . substr( $digits, -4 );
+}
+
+/**
+ * Returns a human-readable, masked label for a user's connected payout account.
+ * Safe to display in UI and admin screens — never exposes raw credentials.
+ */
+function custom_truelysell_get_payout_account_label( $user_id, $method ) {
+	switch ( $method ) {
+		case 'paypal':
+			$email = get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+			return $email ? custom_truelysell_mask_payout_email( $email ) : '';
+		case 'stripe':
+			$email = get_user_meta( $user_id, 'truelysell_stripe_email', true );
+			return $email ? custom_truelysell_mask_payout_email( $email ) : '';
+		case 'bank':
+			$acct   = get_user_meta( $user_id, 'truelysell_bank_account_number', true );
+			$bank   = get_user_meta( $user_id, 'truelysell_bank_name', true );
+			$masked = custom_truelysell_mask_account_number( $acct );
+			return trim( $bank . ( $masked ? ' (' . $masked . ')' : '' ) );
+	}
+	return '';
+}
+
+/**
+ * Returns the human-readable label for a payout method key.
+ */
+function custom_truelysell_payout_method_label( $method ) {
+	$labels = array(
+		'paypal' => __( 'PayPal', 'truelysell' ),
+		'stripe' => __( 'Stripe', 'truelysell' ),
+		'bank'   => __( 'Bank Account', 'truelysell' ),
+	);
+	return isset( $labels[ $method ] ) ? $labels[ $method ] : __( 'Not set', 'truelysell' );
+}
+
+/**
+ * Returns the current payout connection status for a technician user.
+ *
+ * 'connected'     — method chosen and all required fields saved.
+ * 'pending'       — method chosen but details are incomplete.
+ * 'not_connected' — no method set at all.
+ * 'disconnected'  — previously connected, explicitly deactivated.
+ *
+ * Back-compat: infers and back-fills status from existing field data
+ * for technicians who configured their payout before status tracking
+ * was added, so legacy users are not wrongly shown as "not connected."
+ */
+function custom_truelysell_get_payout_status( $user_id ) {
+	$status = get_user_meta( $user_id, 'truelysell_payout_status', true );
+	if ( $status ) {
+		return $status;
+	}
+
+	$method = get_user_meta( $user_id, 'truelysell_payout_method', true );
+	if ( ! $method ) {
+		// Check legacy PayPal-only setup saved by the plugin's own handler.
+		$legacy_paypal = get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+		if ( $legacy_paypal ) {
+			update_user_meta( $user_id, 'truelysell_payout_method', 'paypal' );
+			update_user_meta( $user_id, 'truelysell_payout_status', 'connected' );
+			return 'connected';
+		}
+		return 'not_connected';
+	}
+
+	// Infer from saved field data.
+	$is_complete = false;
+	switch ( $method ) {
+		case 'paypal':
+			$is_complete = (bool) get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+			break;
+		case 'stripe':
+			$is_complete = (bool) get_user_meta( $user_id, 'truelysell_stripe_email', true );
+			break;
+		case 'bank':
+			$is_complete = get_user_meta( $user_id, 'truelysell_bank_account_holder', true )
+				&& get_user_meta( $user_id, 'truelysell_bank_account_number', true );
+			break;
+	}
+
+	$inferred = $is_complete ? 'connected' : 'pending';
+	update_user_meta( $user_id, 'truelysell_payout_status', $inferred );
+	return $inferred;
+}
+
+/**
+ * Guard function — returns true when a technician's payout account is
+ * properly connected and they are cleared to receive payouts.
+ * Returns true unconditionally for non-technician users.
+ */
+function custom_truelysell_is_payout_account_ready( $user_id ) {
+	if ( ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return true;
+	}
+	return 'connected' === custom_truelysell_get_payout_status( $user_id );
+}
+
+add_action( 'wp_footer', 'custom_truelysell_render_additional_payout_methods' );
+function custom_truelysell_render_additional_payout_methods() {
+	$user_id = get_current_user_id();
+	if ( ! $user_id || ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return;
+	}
+
+	$payout_page  = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'payout_page' ) : 0;
+	$current_page = get_queried_object_id();
+	if ( ! $payout_page || absint( $payout_page ) !== absint( $current_page ) ) {
+		return;
+	}
+
+	$saved_method          = get_user_meta( $user_id, 'truelysell_payout_method', true );
+	$saved_status          = custom_truelysell_get_payout_status( $user_id );
+	$saved_stripe_email    = get_user_meta( $user_id, 'truelysell_stripe_email', true );
+	$saved_bank_holder     = get_user_meta( $user_id, 'truelysell_bank_account_holder', true );
+	$saved_bank_name       = get_user_meta( $user_id, 'truelysell_bank_name', true );
+	$saved_bank_account_no = get_user_meta( $user_id, 'truelysell_bank_account_number', true );
+	$saved_bank_routing_no = get_user_meta( $user_id, 'truelysell_bank_routing_number', true );
+	$connected_date        = get_user_meta( $user_id, 'truelysell_payout_connected_date', true );
+	$account_label         = custom_truelysell_get_payout_account_label( $user_id, $saved_method );
+	$method_label          = custom_truelysell_payout_method_label( $saved_method );
+	$payout_saved          = isset( $_GET['payout_saved'] ) && '1' === $_GET['payout_saved'];
+	$is_connected          = $saved_method && 'not_connected' !== $saved_status;
+
+	// Build the status card HTML in PHP so we can pass it as a JS string
+	// and inject it BEFORE the tabs container (in the correct DOM position).
+	ob_start();
+	if ( $is_connected ) {
+		?>
+		<div id="custom-payout-status-card" class="border bg-light mb-4" style="border-radius:8px; padding:16px 20px;">
+			<div class="d-flex align-items-center justify-content-between flex-wrap gap-3">
+				<div>
+					<div class="text-muted small mb-1"><?php esc_html_e( 'Current Payout Method', 'truelysell' ); ?></div>
+					<div class="d-flex align-items-center gap-2 flex-wrap">
+						<strong style="font-size:16px;"><?php echo esc_html( $method_label ); ?></strong>
+						<span class="custom-payout-badge custom-payout-badge-<?php echo esc_attr( $saved_status ); ?>">
+							<?php if ( 'connected' === $saved_status ) : ?>
+								<i class="ti ti-check"></i> <?php esc_html_e( 'Connected', 'truelysell' ); ?>
+							<?php elseif ( 'pending' === $saved_status ) : ?>
+								<i class="ti ti-clock"></i> <?php esc_html_e( 'Pending', 'truelysell' ); ?>
+							<?php else : ?>
+								<i class="ti ti-x"></i> <?php echo esc_html( ucfirst( str_replace( '_', ' ', $saved_status ) ) ); ?>
+							<?php endif; ?>
+						</span>
+					</div>
+					<?php if ( $account_label ) : ?>
+					<div class="text-muted small mt-1">
+						<?php esc_html_e( 'Account:', 'truelysell' ); ?> <strong><?php echo esc_html( $account_label ); ?></strong>
+						<span style="color:#aaa; font-size:11px;">(<?php esc_html_e( 'masked', 'truelysell' ); ?>)</span>
+					</div>
+					<?php endif; ?>
+					<?php if ( $connected_date ) : ?>
+					<div class="text-muted small">
+						<?php esc_html_e( 'Connected:', 'truelysell' ); ?> <?php echo esc_html( date_i18n( get_option( 'date_format' ), $connected_date ) ); ?>
+					</div>
+					<?php endif; ?>
+				</div>
+				<div>
+					<button type="button" class="btn btn-outline-primary btn-sm" id="custom-payout-manage-btn">
+						<i class="ti ti-settings me-1"></i><?php esc_html_e( 'Manage Payout Account', 'truelysell' ); ?>
+					</button>
+				</div>
+			</div>
+		</div>
+		<?php
+	} else {
+		?>
+		<div id="custom-payout-status-card" class="border border-warning bg-light mb-4 py-3 px-4" style="border-radius:8px;">
+			<div class="d-flex align-items-center gap-2">
+				<i class="ti ti-alert-triangle text-warning fs-20"></i>
+				<div>
+					<strong><?php esc_html_e( 'No payout method connected', 'truelysell' ); ?></strong>
+					<div class="text-muted small"><?php esc_html_e( 'Select a payout method below to receive payments for completed jobs.', 'truelysell' ); ?></div>
+				</div>
+			</div>
+		</div>
+		<?php
+	}
+	$status_card_html = trim( ob_get_clean() );
+
+	$success_html = '';
+	if ( $payout_saved ) {
+		$success_html = '<div class="custom-payout-success-notice"><i class="ti ti-circle-check-filled fs-18"></i> '
+			. esc_html__( 'Payout account connected successfully! You will receive future payouts through your selected method.', 'truelysell' )
+			. '</div>';
+	}
+
+	$confirm_html = '<div id="custom-payout-confirm-overlay" role="dialog" aria-modal="true">'
+		. '<div id="custom-payout-confirm-box">'
+		. '<h5>' . esc_html__( 'Change Payout Method?', 'truelysell' ) . '</h5>'
+		. '<p id="custom-payout-confirm-msg"></p>'
+		. '<div class="d-flex gap-2 justify-content-end">'
+		. '<button type="button" class="btn btn-light" id="custom-payout-confirm-cancel">' . esc_html__( 'Keep Current', 'truelysell' ) . '</button>'
+		. '<button type="button" class="btn btn-primary" id="custom-payout-confirm-proceed">' . esc_html__( 'Yes, Change Method', 'truelysell' ) . '</button>'
+		. '</div></div></div>';
+	?>
+	<style>
+	.custom-payout-badge { border-radius: 20px; padding: 3px 12px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+	.custom-payout-badge-connected    { color: #1a7f37; background: #d4f7dc; border: 1px solid #a3e6b3; }
+	.custom-payout-badge-pending      { color: #9a6700; background: #fff3cd; border: 1px solid #ffe08a; }
+	.custom-payout-badge-not_connected,.custom-payout-badge-disconnected { color: #842029; background: #f8d7da; border: 1px solid #f5c2c7; }
+	.custom-payout-success-notice { background: #d4f7dc; border: 1px solid #a3e6b3; color: #1a7f37; border-radius: 6px; padding: 12px 16px; margin-bottom: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+	#custom-payout-confirm-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 99999; align-items: center; justify-content: center; }
+	#custom-payout-confirm-overlay.is-open { display: flex; }
+	#custom-payout-confirm-box { background: #fff; border-radius: 10px; padding: 28px 32px; max-width: 440px; width: 90%; box-shadow: 0 8px 32px rgba(0,0,0,0.18); }
+	#custom-payout-confirm-box h5 { margin: 0 0 12px; font-size: 18px; font-weight: 700; }
+	#custom-payout-confirm-box p  { margin: 0 0 20px; color: #555; line-height: 1.5; }
+	</style>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var tabsContainer = document.querySelector('.payment.payout-method-tabs');
+		var paypalRadio   = document.getElementById('paypal');
+		if (!tabsContainer || !paypalRadio) {
+			return;
+		}
+
+		var savedMethod  = <?php echo wp_json_encode( $saved_method ); ?>;
+		var savedStatus  = <?php echo wp_json_encode( $saved_status ); ?>;
+		var methodLabel  = <?php echo wp_json_encode( $method_label ); ?>;
+		var isConnected  = <?php echo wp_json_encode( $is_connected ); ?>;
+
+		// ── Step 1: Inject the success notice + status card BEFORE the
+		//    tabs container. This puts them inline inside the plugin's
+		//    form, not as a separate floating footer element.
+		var successHtml = <?php echo wp_json_encode( $success_html ); ?>;
+		var statusCardHtml = <?php echo wp_json_encode( $status_card_html ); ?>;
+		var confirmHtml    = <?php echo wp_json_encode( $confirm_html ); ?>;
+
+		if (successHtml) {
+			tabsContainer.insertAdjacentHTML('beforebegin', successHtml);
+		}
+		tabsContainer.insertAdjacentHTML('beforebegin', statusCardHtml);
+
+		// Confirmation overlay is position:fixed so it lives in <body>.
+		document.body.insertAdjacentHTML('beforeend', confirmHtml);
+
+		var manageBtn      = document.getElementById('custom-payout-manage-btn');
+		var confirmOvl     = document.getElementById('custom-payout-confirm-overlay');
+		var confirmMsg     = document.getElementById('custom-payout-confirm-msg');
+		var confirmCancel  = document.getElementById('custom-payout-confirm-cancel');
+		var confirmProceed = document.getElementById('custom-payout-confirm-proceed');
+		var pendingRadio   = null;
+
+		// ── Step 2: Add Stripe and Bank Account tabs to the existing tabs container.
+		var stripeTabHtml =
+			'<div class="payment-tab" id="truelysell-stripe-tab">' +
+				'<div class="payment-tab-trigger">' +
+					'<input id="stripe" name="payment_type" type="radio" value="stripe">' +
+					'<label for="stripe"><?php echo esc_js( __( 'Stripe', 'truelysell' ) ); ?></label>' +
+				'</div>' +
+				'<div class="payment-tab-content" style="display:none;">' +
+					'<div class="form-group mb-3">' +
+						'<label for="stripe_email" class="form-label"><?php echo esc_js( __( 'Stripe Email / Account ID', 'truelysell' ) ); ?></label>' +
+						'<input id="stripe_email" class="form-control" name="stripe_email" type="text" value="<?php echo esc_js( $saved_stripe_email ); ?>" placeholder="<?php echo esc_js( __( 'your@stripe-email.com or acct_XXXXXXXXX', 'truelysell' ) ); ?>">' +
+						'<small class="text-muted"><?php echo esc_js( __( 'Enter your Stripe account email or Connected Account ID. Your Stripe login credentials are never stored here.', 'truelysell' ) ); ?></small>' +
+					'</div>' +
+				'</div>' +
+			'</div>';
+
+		var bankTabHtml =
+			'<div class="payment-tab" id="truelysell-bank-tab">' +
+				'<div class="payment-tab-trigger">' +
+					'<input id="bank_account" name="payment_type" type="radio" value="bank">' +
+					'<label for="bank_account"><?php echo esc_js( __( 'Bank Account', 'truelysell' ) ); ?></label>' +
+				'</div>' +
+				'<div class="payment-tab-content" style="display:none;">' +
+					'<div class="alert alert-info py-2 px-3 mb-3" style="font-size:13px;">' +
+						'<i class="ti ti-lock me-1"></i><?php echo esc_js( __( 'Your banking details are stored securely and are never displayed publicly.', 'truelysell' ) ); ?>' +
+					'</div>' +
+					'<div class="form-group mb-3">' +
+						'<label for="bank_account_holder" class="form-label"><?php echo esc_js( __( 'Account Holder Name', 'truelysell' ) ); ?></label>' +
+						'<input id="bank_account_holder" class="form-control" name="bank_account_holder" type="text" value="<?php echo esc_js( $saved_bank_holder ); ?>">' +
+					'</div>' +
+					'<div class="form-group mb-3">' +
+						'<label for="bank_name" class="form-label"><?php echo esc_js( __( 'Bank Name', 'truelysell' ) ); ?></label>' +
+						'<input id="bank_name" class="form-control" name="bank_name" type="text" value="<?php echo esc_js( $saved_bank_name ); ?>">' +
+					'</div>' +
+					'<div class="form-group mb-3">' +
+						'<label for="bank_account_number" class="form-label"><?php echo esc_js( __( 'Account Number', 'truelysell' ) ); ?></label>' +
+						'<input id="bank_account_number" class="form-control" name="bank_account_number" type="text" value="<?php echo esc_js( $saved_bank_account_no ); ?>" autocomplete="off">' +
+					'</div>' +
+					'<div class="form-group mb-3">' +
+						'<label for="bank_routing_number" class="form-label"><?php echo esc_js( __( 'Routing Number', 'truelysell' ) ); ?></label>' +
+						'<input id="bank_routing_number" class="form-control" name="bank_routing_number" type="text" value="<?php echo esc_js( $saved_bank_routing_no ); ?>" autocomplete="off">' +
+					'</div>' +
+				'</div>' +
+			'</div>';
+
+		var paypalTab = paypalRadio.closest('.payment-tab');
+		if (paypalTab && paypalTab.parentNode) {
+			paypalTab.insertAdjacentHTML('afterend', stripeTabHtml + bankTabHtml);
+		} else {
+			tabsContainer.insertAdjacentHTML('beforeend', stripeTabHtml + bankTabHtml);
+		}
+
+		// ── Step 3: Sync tab content panels based on selected radio.
+		function syncActiveTab() {
+			tabsContainer.querySelectorAll('input[name="payment_type"]').forEach(function (radio) {
+				var tab     = radio.closest('.payment-tab');
+				var content = tab ? tab.querySelector('.payment-tab-content') : null;
+				var active  = radio.checked;
+				if (tab)     { tab.classList.toggle('payment-tab-active', active); }
+				if (content) { content.style.display = active ? 'block' : 'none'; }
+			});
+		}
+
+		// ── Step 4: Confirmation dialog when switching from an already-connected method.
+		function openConfirm( radio ) {
+			pendingRadio = radio;
+			var newLabel = radio.value === 'paypal' ? 'PayPal' : (radio.value === 'stripe' ? 'Stripe' : '<?php echo esc_js( __( 'Bank Account', 'truelysell' ) ); ?>');
+			if (confirmMsg) {
+				confirmMsg.textContent = '<?php echo esc_js( __( 'You are currently receiving payouts via', 'truelysell' ) ); ?> '
+					+ methodLabel + '. <?php echo esc_js( __( 'Switching to', 'truelysell' ) ); ?> '
+					+ newLabel + ' <?php echo esc_js( __( 'will replace your current payout connection. Continue?', 'truelysell' ) ); ?>';
+			}
+			if (confirmOvl) { confirmOvl.classList.add('is-open'); }
+		}
+
+		function closeConfirm( proceed ) {
+			if (confirmOvl) { confirmOvl.classList.remove('is-open'); }
+			if (proceed && pendingRadio) {
+				pendingRadio.checked = true;
+				syncActiveTab();
+			}
+			pendingRadio = null;
+		}
+
+		if (confirmCancel)  { confirmCancel.addEventListener('click',  function () { closeConfirm(false); }); }
+		if (confirmProceed) { confirmProceed.addEventListener('click', function () { closeConfirm(true);  }); }
+		if (confirmOvl) {
+			confirmOvl.addEventListener('click', function (e) {
+				if (e.target === confirmOvl) { closeConfirm(false); }
+			});
+		}
+
+		tabsContainer.querySelectorAll('input[name="payment_type"]').forEach(function (radio) {
+			radio.addEventListener('change', function () {
+				if (savedStatus === 'connected' && savedMethod && radio.value !== savedMethod) {
+					radio.checked = false;
+					openConfirm(radio);
+				} else {
+					syncActiveTab();
+				}
+			});
+		});
+
+		// Pre-select the saved method.
+		if (savedMethod && savedMethod !== 'paypal') {
+			var savedRadio = tabsContainer.querySelector('input[name="payment_type"][value="' + savedMethod + '"]');
+			if (savedRadio) {
+				paypalRadio.checked = false;
+				savedRadio.checked  = true;
+			}
+		}
+		syncActiveTab();
+
+		// ── Step 5: "Manage Payout Account" toggle — hides/shows the tabs
+		//    container ITSELF (no separate wrapper div needed).
+		if (isConnected) {
+			tabsContainer.style.display = 'none';
+		}
+
+		if (manageBtn) {
+			manageBtn.addEventListener('click', function () {
+				var hidden = (tabsContainer.style.display === 'none');
+				tabsContainer.style.display = hidden ? '' : 'none';
+				manageBtn.innerHTML = hidden
+					? '<i class="ti ti-x me-1"></i><?php echo esc_js( __( 'Cancel', 'truelysell' ) ); ?>'
+					: '<i class="ti ti-settings me-1"></i><?php echo esc_js( __( 'Manage Payout Account', 'truelysell' ) ); ?>';
+			});
+		}
+
+		// ── Step 6: Override the plugin's AJAX submit so our fields reach the server.
+		var payoutForm = document.getElementById('edit_user');
+		if (payoutForm) {
+			payoutForm.addEventListener('submit', function (e) {
+				e.preventDefault();
+				e.stopImmediatePropagation();
+
+				var submitBtn = payoutForm.querySelector('button[type="submit"], button:not([type])') || payoutForm.querySelector('button');
+				if (submitBtn) { submitBtn.disabled = true; }
+
+				var dest = new URL(payoutForm.action || window.location.href, window.location.href);
+				fetch(dest.toString(), { method: 'POST', body: new FormData(payoutForm) })
+					.then(function () {
+						var redir = new URL(window.location.href);
+						redir.searchParams.set('payout_saved', '1');
+						window.location.href = redir.toString();
+					})
+					.catch(function () {
+						if (submitBtn) { submitBtn.disabled = false; }
+						window.alert(<?php echo wp_json_encode( __( 'Could not save. Please try again.', 'truelysell' ) ); ?>);
+					});
+			}, true);
+		}
+	});
+	</script>
+	<?php
+}
+/**
+ * Saves the payout method + all related fields submitted through the
+ * Payout page form. Also sets connection status, date, and masked label.
+ *
+ * Priority 5 — BEFORE the plugin's own my-account save handler (priority 10)
+ * so our fields are read before the plugin can silently discard them.
+ * When switching methods, the previous method's data is cleared to prevent
+ * stale credentials from lingering.
+ */
+add_action( 'init', 'custom_truelysell_save_additional_payout_methods', 5 );
+function custom_truelysell_save_additional_payout_methods() {
+	if ( ! isset( $_POST['my-account-submission'] ) || ! isset( $_POST['payment_type'] ) ) {
+		return;
+	}
+
+	$user_id = get_current_user_id();
+	if ( ! $user_id || ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return;
+	}
+
+	$payment_type = sanitize_text_field( wp_unslash( $_POST['payment_type'] ) );
+	if ( ! in_array( $payment_type, array( 'paypal', 'stripe', 'bank' ), true ) ) {
+		return;
+	}
+
+	$prev_method = get_user_meta( $user_id, 'truelysell_payout_method', true );
+
+	// When switching methods, clear the previous method's stored fields
+	// so stale data from the old method doesn't persist or mislead admin.
+	if ( $prev_method && $prev_method !== $payment_type ) {
+		if ( 'stripe' === $prev_method ) {
+			delete_user_meta( $user_id, 'truelysell_stripe_email' );
+		}
+		if ( 'bank' === $prev_method ) {
+			delete_user_meta( $user_id, 'truelysell_bank_account_holder' );
+			delete_user_meta( $user_id, 'truelysell_bank_name' );
+			delete_user_meta( $user_id, 'truelysell_bank_account_number' );
+			delete_user_meta( $user_id, 'truelysell_bank_routing_number' );
+		}
+		// PayPal email is managed by the plugin's own handler; don't clear
+		// it here to avoid conflicting with native plugin behaviour.
+		// Reset connected date when switching methods — a new connection starts fresh.
+		delete_user_meta( $user_id, 'truelysell_payout_connected_date' );
+	}
+
+	update_user_meta( $user_id, 'truelysell_payout_method', $payment_type );
+
+	// Save method-specific fields and determine if the setup is complete.
+	$is_complete = false;
+
+	if ( 'paypal' === $payment_type ) {
+		// PayPal email is saved by the plugin's own handler via 'ppemail'.
+		// Read it now (before the plugin processes it) or fall back to what's stored.
+		$paypal_email = isset( $_POST['ppemail'] ) ? sanitize_email( wp_unslash( $_POST['ppemail'] ) ) : get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+		$is_complete  = ! empty( $paypal_email );
+	}
+
+	if ( 'stripe' === $payment_type && isset( $_POST['stripe_email'] ) ) {
+		$stripe_val = sanitize_text_field( wp_unslash( $_POST['stripe_email'] ) );
+		update_user_meta( $user_id, 'truelysell_stripe_email', $stripe_val );
+		$is_complete = ! empty( $stripe_val );
+	}
+
+	if ( 'bank' === $payment_type ) {
+		$holder  = isset( $_POST['bank_account_holder'] ) ? sanitize_text_field( wp_unslash( $_POST['bank_account_holder'] ) ) : '';
+		$bank_nm = isset( $_POST['bank_name'] )           ? sanitize_text_field( wp_unslash( $_POST['bank_name'] ) )           : '';
+		$acct_no = isset( $_POST['bank_account_number'] ) ? sanitize_text_field( wp_unslash( $_POST['bank_account_number'] ) ) : '';
+		$rout_no = isset( $_POST['bank_routing_number'] ) ? sanitize_text_field( wp_unslash( $_POST['bank_routing_number'] ) ) : '';
+
+		if ( $holder  ) { update_user_meta( $user_id, 'truelysell_bank_account_holder',  $holder  ); }
+		if ( $bank_nm ) { update_user_meta( $user_id, 'truelysell_bank_name',             $bank_nm ); }
+		if ( $acct_no ) { update_user_meta( $user_id, 'truelysell_bank_account_number',   $acct_no ); }
+		if ( $rout_no ) { update_user_meta( $user_id, 'truelysell_bank_routing_number',   $rout_no ); }
+
+		$is_complete = $holder && $acct_no;
+	}
+
+	// Set connection status.
+	// We no longer auto-connect. When a technician submits details, it goes to 'pending'
+	// so the admin can verify the details.
+	$new_status = $is_complete ? 'pending' : 'not_connected';
+	update_user_meta( $user_id, 'truelysell_payout_status', $new_status );
+
+	// Record the first connection date if somehow marked connected (never overwrite once set).
+	if ( 'connected' === $new_status && ! get_user_meta( $user_id, 'truelysell_payout_connected_date', true ) ) {
+		update_user_meta( $user_id, 'truelysell_payout_connected_date', current_time( 'timestamp' ) );
+	}
+
+	// Store the masked account label for quick display without re-reading raw fields.
+	$label = custom_truelysell_get_payout_account_label( $user_id, $payment_type );
+	update_user_meta( $user_id, 'truelysell_payout_account_label', $label );
+}
+
+/**
+ * Handle admin updating the payout status from the profile screen
+ */
+add_action( 'edit_user_profile_update', 'custom_truelysell_admin_update_payout_status' );
+function custom_truelysell_admin_update_payout_status( $user_id ) {
+	if ( ! current_user_can( 'edit_user', $user_id ) || ! isset( $_POST['admin_payout_status'] ) ) {
+		return;
+	}
+	
+	$new_status = sanitize_text_field( $_POST['admin_payout_status'] );
+	update_user_meta( $user_id, 'truelysell_payout_status', $new_status );
+	
+	if ( 'connected' === $new_status && ! get_user_meta( $user_id, 'truelysell_payout_connected_date', true ) ) {
+		update_user_meta( $user_id, 'truelysell_payout_connected_date', current_time( 'timestamp' ) );
+	}
+}
+
+/**
+ * Show the technician's payout method, status, date, and FULL account details
+ * on their WP Admin profile screen. Admins need full visibility to transfer funds.
+ */
+add_action( 'show_user_profile', 'custom_truelysell_show_payout_method_on_profile' );
+add_action( 'edit_user_profile', 'custom_truelysell_show_payout_method_on_profile' );
+function custom_truelysell_show_payout_method_on_profile( $user ) {
+	if ( ! custom_truelysell_is_restricted_provider( $user->ID ) ) {
+		return;
+	}
+
+	$method         = get_user_meta( $user->ID, 'truelysell_payout_method', true );
+	$status         = custom_truelysell_get_payout_status( $user->ID );
+	$connected_date = get_user_meta( $user->ID, 'truelysell_payout_connected_date', true );
+
+	if ( ! $method ) {
+		$legacy = get_user_meta( $user->ID, 'truelysell_paypal_payout_email', true );
+		if ( $legacy ) {
+			$method = 'paypal';
+		}
+	}
+	
+	// Fetch raw unmasked details for the admin.
+	$raw_account_label = '';
+	if ( 'paypal' === $method ) {
+		$raw_account_label = get_user_meta( $user->ID, 'truelysell_paypal_payout_email', true );
+	} elseif ( 'stripe' === $method ) {
+		$raw_account_label = get_user_meta( $user->ID, 'truelysell_stripe_email', true );
+	}
+
+	$status_display = array(
+		'connected'     => array( 'text' => '✓ ' . __( 'Connected', 'truelysell' ),           'color' => '#1a7f37' ),
+		'pending'       => array( 'text' => '⚠ ' . __( 'Pending Verification', 'truelysell' ), 'color' => '#9a6700' ),
+		'not_connected' => array( 'text' => '✗ ' . __( 'Not Connected', 'truelysell' ),        'color' => '#842029' ),
+		'disconnected'  => array( 'text' => '✗ ' . __( 'Disconnected', 'truelysell' ),         'color' => '#842029' ),
+	);
+	$sd = isset( $status_display[ $status ] ) ? $status_display[ $status ] : array( 'text' => esc_html( $status ), 'color' => '#555' );
+	?>
+	<h2><?php esc_html_e( 'Payout Method (Admin View)', 'truelysell' ); ?></h2>
+	<table class="form-table" role="presentation">
+		<tr>
+			<th><?php esc_html_e( 'Method', 'truelysell' ); ?></th>
+			<td>
+				<?php if ( $method ) : ?>
+					<strong><?php echo esc_html( custom_truelysell_payout_method_label( $method ) ); ?></strong>
+				<?php else : ?>
+					<em style="color:#787c82;"><?php esc_html_e( 'Not set', 'truelysell' ); ?></em>
+				<?php endif; ?>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e( 'Verification Status', 'truelysell' ); ?></th>
+			<td>
+				<select name="admin_payout_status" id="admin_payout_status">
+					<option value="pending" <?php selected( $status, 'pending' ); ?>><?php esc_html_e( 'Pending Verification', 'truelysell' ); ?></option>
+					<option value="connected" <?php selected( $status, 'connected' ); ?>><?php esc_html_e( 'Verified & Connected', 'truelysell' ); ?></option>
+					<option value="disconnected" <?php selected( $status, 'disconnected' ); ?>><?php esc_html_e( 'Disconnected', 'truelysell' ); ?></option>
+					<option value="not_connected" <?php selected( $status, 'not_connected' ); ?>><?php esc_html_e( 'Not Connected', 'truelysell' ); ?></option>
+				</select>
+				<p class="description"><?php esc_html_e( 'Change this to "Verified & Connected" after reviewing their details.', 'truelysell' ); ?></p>
+			</td>
+		</tr>
+		<?php if ( 'paypal' === $method || 'stripe' === $method ) : ?>
+		<tr>
+			<th><?php esc_html_e( 'Account Detail', 'truelysell' ); ?></th>
+			<td>
+				<strong><?php echo esc_html( $raw_account_label ); ?></strong>
+				<p class="description"><?php esc_html_e( '(Only visible to Admins)', 'truelysell' ); ?></p>
+			</td>
+		</tr>
+		<?php endif; ?>
+		<?php if ( $connected_date ) : ?>
+		<tr>
+			<th><?php esc_html_e( 'Date Connected', 'truelysell' ); ?></th>
+			<td><?php echo esc_html( date_i18n( get_option( 'date_format' ), $connected_date ) ); ?></td>
+		</tr>
+		<?php endif; ?>
+		<?php if ( 'bank' === $method ) : ?>
+		<tr>
+			<th><?php esc_html_e( 'Bank Details', 'truelysell' ); ?></th>
+			<td>
+				<?php $holder = get_user_meta( $user->ID, 'truelysell_bank_account_holder', true ); ?>
+				<?php $bank   = get_user_meta( $user->ID, 'truelysell_bank_name', true ); ?>
+				<?php if ( $holder ) : ?>
+					<strong><?php esc_html_e( 'Holder:', 'truelysell' ); ?></strong> <?php echo esc_html( $holder ); ?><br>
+				<?php endif; ?>
+				<?php if ( $bank ) : ?>
+					<strong><?php esc_html_e( 'Bank:', 'truelysell' ); ?></strong> <?php echo esc_html( $bank ); ?><br>
+				<?php endif; ?>
+				<strong><?php esc_html_e( 'Account:', 'truelysell' ); ?></strong>
+				<?php echo esc_html( get_user_meta( $user->ID, 'truelysell_bank_account_number', true ) ); ?><br>
+				<strong><?php esc_html_e( 'Routing:', 'truelysell' ); ?></strong>
+				<?php echo esc_html( get_user_meta( $user->ID, 'truelysell_bank_routing_number', true ) ); ?>
+				<p class="description"><?php esc_html_e( '(Full bank details are only visible to Admins)', 'truelysell' ); ?></p>
+			</td>
+		</tr>
+		<?php endif; ?>
+	</table>
+	<?php
+}
+
+// ============================================================
+// ADMIN: PAYOUT METHOD COLUMN IN USERS LIST TABLE
+// Shows each technician's payout method and connection status badge
+// directly in the Users list, so admin doesn't need to open each profile.
+// ============================================================
+
+add_filter( 'manage_users_columns', 'custom_truelysell_add_payout_method_column' );
+function custom_truelysell_add_payout_method_column( $columns ) {
+	$columns['custom_ts_payout'] = __( 'Payout Method', 'truelysell' );
+	return $columns;
+}
+
+add_filter( 'manage_users_custom_column', 'custom_truelysell_render_payout_method_column', 10, 3 );
+function custom_truelysell_render_payout_method_column( $value, $column_name, $user_id ) {
+	if ( 'custom_ts_payout' !== $column_name ) {
+		return $value;
+	}
+
+	if ( ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return '—';
+	}
+
+	$method = get_user_meta( $user_id, 'truelysell_payout_method', true );
+	if ( ! $method ) {
+		$legacy = get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+		if ( $legacy ) {
+			$method = 'paypal';
+		}
+	}
+
+	if ( ! $method ) {
+		return '<span style="color:#842029; font-size:12px;">✗ Not set</span>';
+	}
+
+	$status       = custom_truelysell_get_payout_status( $user_id );
+	$method_label = custom_truelysell_payout_method_label( $method );
+
+	$badge_styles = array(
+		'connected'     => 'background:#d4f7dc; color:#1a7f37; border:1px solid #a3e6b3;',
+		'pending'       => 'background:#fff3cd; color:#9a6700; border:1px solid #ffe08a;',
+		'not_connected' => 'background:#f8d7da; color:#842029; border:1px solid #f5c2c7;',
+		'disconnected'  => 'background:#f8d7da; color:#842029; border:1px solid #f5c2c7;',
+	);
+	$badge_style = isset( $badge_styles[ $status ] ) ? $badge_styles[ $status ] : 'background:#e9ecef; color:#555;';
+
+	$status_texts = array(
+		'connected'     => '✓ ' . __( 'Connected', 'truelysell' ),
+		'pending'       => '⚠ ' . __( 'Pending', 'truelysell' ),
+		'not_connected' => '✗ ' . __( 'Not set', 'truelysell' ),
+		'disconnected'  => '✗ ' . __( 'Off', 'truelysell' ),
+	);
+	$status_text = isset( $status_texts[ $status ] ) ? $status_texts[ $status ] : esc_html( $status );
+
+	return '<div style="white-space:nowrap;">' .
+		'<strong>' . esc_html( $method_label ) . '</strong><br>' .
+		'<span style="font-size:11px; padding:1px 6px; border-radius:10px; ' . esc_attr( $badge_style ) . '">' . esc_html( $status_text ) . '</span>' .
+		'</div>';
+}
+
+// ============================================================
+// ADMIN: TECHNICIAN PAYOUT MANAGEMENT PAGE
+// Users → Technician Payouts — a dedicated sortable table showing
+// every technician's payout method, status, masked account label,
+// and date connected. No raw credentials are ever shown.
+// ============================================================
+
+add_action( 'admin_menu', 'custom_truelysell_register_payout_admin_menu' );
+function custom_truelysell_register_payout_admin_menu() {
+	if ( ! current_user_can( 'administrator' ) ) {
+		return;
+	}
+	add_users_page(
+		__( 'Technician Payouts', 'truelysell' ),
+		__( 'Technician Payouts', 'truelysell' ),
+		'administrator',
+		'custom-truelysell-payouts',
+		'custom_truelysell_render_payout_admin_page'
+	);
+}
+
+function custom_truelysell_render_payout_admin_page() {
+	if ( ! current_user_can( 'administrator' ) ) {
+		wp_die( esc_html__( 'Access denied.', 'truelysell' ) );
+	}
+
+	$filter_method = isset( $_GET['filter_method'] ) ? sanitize_text_field( $_GET['filter_method'] ) : '';
+	$filter_status = isset( $_GET['filter_status'] ) ? sanitize_text_field( $_GET['filter_status'] ) : '';
+
+	// Collect all technician users (by role and by is_technician meta).
+	$by_role = get_users( array(
+		'role__in' => array( 'owner', 'provider' ),
+		'orderby'  => 'display_name',
+		'order'    => 'ASC',
+	) );
+	$by_meta = get_users( array(
+		'meta_key'   => 'is_technician',
+		'meta_value' => '1',
+		'orderby'    => 'display_name',
+		'order'      => 'ASC',
+	) );
+
+	$all_users = array();
+	foreach ( array_merge( $by_role, $by_meta ) as $u ) {
+		$all_users[ $u->ID ] = $u;
+	}
+
+	$rows = array();
+	foreach ( $all_users as $user_id => $user ) {
+		// Admins are never technicians (same rule as custom_truelysell_is_restricted_provider).
+		if ( in_array( 'administrator', (array) $user->roles, true ) ) {
+			continue;
+		}
+
+		$method = get_user_meta( $user_id, 'truelysell_payout_method', true );
+		if ( ! $method ) {
+			$legacy = get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+			if ( $legacy ) {
+				$method = 'paypal';
+			}
+		}
+
+		$status = custom_truelysell_get_payout_status( $user_id );
+		
+		// Fetch raw unmasked details for the admin table.
+		$label = '';
+		if ( 'paypal' === $method ) {
+			$label = get_user_meta( $user_id, 'truelysell_paypal_payout_email', true );
+		} elseif ( 'stripe' === $method ) {
+			$label = get_user_meta( $user_id, 'truelysell_stripe_email', true );
+		} elseif ( 'bank' === $method ) {
+			$acct = get_user_meta( $user_id, 'truelysell_bank_account_number', true );
+			$rout = get_user_meta( $user_id, 'truelysell_bank_routing_number', true );
+			$label = ( $acct || $rout ) ? "Acct: $acct | Rout: $rout" : '';
+		}
+		
+		$date = get_user_meta( $user_id, 'truelysell_payout_connected_date', true );
+
+		if ( $filter_method && $method !== $filter_method ) {
+			continue;
+		}
+		if ( $filter_status && $status !== $filter_status ) {
+			continue;
+		}
+
+		$rows[] = compact( 'user_id', 'user', 'method', 'status', 'label', 'date' );
+	}
+
+	$methods_list = array(
+		''       => __( 'All Methods', 'truelysell' ),
+		'paypal' => __( 'PayPal', 'truelysell' ),
+		'stripe' => __( 'Stripe', 'truelysell' ),
+		'bank'   => __( 'Bank Account', 'truelysell' ),
+	);
+	$statuses_list = array(
+		''              => __( 'All Statuses', 'truelysell' ),
+		'connected'     => __( 'Connected', 'truelysell' ),
+		'pending'       => __( 'Pending', 'truelysell' ),
+		'not_connected' => __( 'Not Connected', 'truelysell' ),
+		'disconnected'  => __( 'Disconnected', 'truelysell' ),
+	);
+
+	$badge_styles = array(
+		'connected'     => 'background:#d4f7dc; color:#1a7f37;',
+		'pending'       => 'background:#fff3cd; color:#9a6700;',
+		'not_connected' => 'background:#f8d7da; color:#842029;',
+		'disconnected'  => 'background:#f8d7da; color:#842029;',
+	);
+	$status_labels = array(
+		'connected'     => '✓ ' . __( 'Connected', 'truelysell' ),
+		'pending'       => '⚠ ' . __( 'Pending', 'truelysell' ),
+		'not_connected' => '✗ ' . __( 'Not Connected', 'truelysell' ),
+		'disconnected'  => '✗ ' . __( 'Disconnected', 'truelysell' ),
+	);
+	?>
+	<div class="wrap">
+		<h1 class="wp-heading-inline"><?php esc_html_e( 'Technician Payouts', 'truelysell' ); ?></h1>
+		<hr class="wp-header-end">
+
+		<form method="get" style="margin:16px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+			<input type="hidden" name="page" value="custom-truelysell-payouts">
+			<select name="filter_method">
+				<?php foreach ( $methods_list as $val => $lbl ) : ?>
+					<option value="<?php echo esc_attr( $val ); ?>" <?php selected( $filter_method, $val ); ?>><?php echo esc_html( $lbl ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<select name="filter_status">
+				<?php foreach ( $statuses_list as $val => $lbl ) : ?>
+					<option value="<?php echo esc_attr( $val ); ?>" <?php selected( $filter_status, $val ); ?>><?php echo esc_html( $lbl ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<button type="submit" class="button"><?php esc_html_e( 'Filter', 'truelysell' ); ?></button>
+			<a href="<?php echo esc_url( admin_url( 'users.php?page=custom-truelysell-payouts' ) ); ?>" class="button"><?php esc_html_e( 'Reset', 'truelysell' ); ?></a>
+			<span style="color:#555; margin-left:8px; font-size:13px;">
+				<?php printf( esc_html__( '%d technician(s) shown', 'truelysell' ), count( $rows ) ); ?>
+			</span>
+		</form>
+
+		<table class="wp-list-table widefat fixed striped">
+			<thead>
+				<tr>
+					<th style="width:180px;"><?php esc_html_e( 'Technician', 'truelysell' ); ?></th>
+					<th style="width:200px;"><?php esc_html_e( 'Email', 'truelysell' ); ?></th>
+					<th style="width:120px;"><?php esc_html_e( 'Payout Method', 'truelysell' ); ?></th>
+					<th style="width:150px;"><?php esc_html_e( 'Status', 'truelysell' ); ?></th>
+					<th><?php esc_html_e( 'Account / Connection ID', 'truelysell' ); ?></th>
+					<th style="width:120px;"><?php esc_html_e( 'Date Connected', 'truelysell' ); ?></th>
+					<th style="width:80px;"><?php esc_html_e( 'Actions', 'truelysell' ); ?></th>
+				</tr>
+			</thead>
+			<tbody>
+			<?php if ( empty( $rows ) ) : ?>
+				<tr>
+					<td colspan="7">
+						<em><?php esc_html_e( 'No technicians found matching the selected filters.', 'truelysell' ); ?></em>
+					</td>
+				</tr>
+			<?php else : ?>
+				<?php foreach ( $rows as $row ) :
+					$bs  = isset( $badge_styles[ $row['status'] ] ) ? $badge_styles[ $row['status'] ] : 'background:#e9ecef; color:#555;';
+					$sl  = isset( $status_labels[ $row['status'] ] ) ? $status_labels[ $row['status'] ] : esc_html( $row['status'] );
+				?>
+				<tr>
+					<td><strong><?php echo esc_html( $row['user']->display_name ); ?></strong></td>
+					<td style="word-break:break-all;"><?php echo esc_html( $row['user']->user_email ); ?></td>
+					<td><?php echo $row['method'] ? esc_html( custom_truelysell_payout_method_label( $row['method'] ) ) : '<em style="color:#999;">—</em>'; ?></td>
+					<td>
+						<span style="font-size:12px; padding:2px 8px; border-radius:12px; font-weight:600; <?php echo esc_attr( $bs ); ?>">
+							<?php echo esc_html( $sl ); ?>
+						</span>
+					</td>
+					<td><?php echo $row['label'] ? esc_html( $row['label'] ) : '<em style="color:#999;">—</em>'; ?></td>
+					<td><?php echo $row['date'] ? esc_html( date_i18n( get_option( 'date_format' ), $row['date'] ) ) : '<em style="color:#999;">—</em>'; ?></td>
+					<td><a href="<?php echo esc_url( get_edit_user_link( $row['user_id'] ) ); ?>" class="button button-small"><?php esc_html_e( 'View', 'truelysell' ); ?></a></td>
+				</tr>
+				<?php endforeach; ?>
+			<?php endif; ?>
+			</tbody>
+		</table>
+		<p class="description" style="margin-top:12px;">
+			<strong><?php esc_html_e( 'Security note:', 'truelysell' ); ?></strong>
+			<?php esc_html_e( 'Full account numbers and routing details are visible on this page. These details are only visible to Administrators and are masked for all other users.', 'truelysell' ); ?>
+		</p>
+	</div>
+	<?php
+}
+
+// ============================================================
+// PAYOUT GUARD — Block payouts and show alerts when a technician's
+// payout account is not properly connected or verified.
+// ============================================================
+
+/**
+ * Shows a bottom-bar alert on provider dashboard pages when their payout
+ * account is not connected. Guides them to the Payout page to fix it.
+ * Not shown on the Payout page itself (where the form already handles this).
+ */
+add_action( 'wp_footer', 'custom_truelysell_payout_guard_notice' );
+function custom_truelysell_payout_guard_notice() {
+	$user_id = get_current_user_id();
+	if ( ! $user_id || ! custom_truelysell_is_restricted_provider( $user_id ) ) {
+		return;
+	}
+
+	$status = custom_truelysell_get_payout_status( $user_id );
+	if ( 'connected' === $status ) {
+		return;
+	}
+
+	$payout_page  = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'payout_page' ) : 0;
+	$current_page = get_queried_object_id();
+
+	// Don't show on the Payout page itself — it has its own status card.
+	if ( $payout_page && absint( $payout_page ) === absint( $current_page ) ) {
+		return;
+	}
+
+	// Only show on provider-facing dashboard pages.
+	$dashboard_page = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'dashboard_page' ) : 0;
+	$bookings_page  = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'bookings_page' ) : 0;
+	$wallet_page    = function_exists( 'truelysell_fl_framework_getoptions' ) ? truelysell_fl_framework_getoptions( 'wallet_page' ) : 0;
+
+	$on_provider_page = (
+		( $dashboard_page && absint( $dashboard_page ) === absint( $current_page ) ) ||
+		( $bookings_page  && absint( $bookings_page )  === absint( $current_page ) ) ||
+		( $wallet_page    && absint( $wallet_page )    === absint( $current_page ) )
+	);
+
+	if ( ! $on_provider_page ) {
+		return;
+	}
+
+	$messages = array(
+		'pending'       => __( 'Your payout account setup is incomplete. Please finish connecting your payout method to ensure you receive payments for completed jobs.', 'truelysell' ),
+		'disconnected'  => __( 'Your payout account has been disconnected. Please reconnect your payout method to continue receiving payments.', 'truelysell' ),
+		'not_connected' => __( 'You have not connected a payout method. You will not receive payouts until you connect a payout method.', 'truelysell' ),
+	);
+	$message  = isset( $messages[ $status ] ) ? $messages[ $status ] : $messages['not_connected'];
+	$payout_url = $payout_page ? esc_js( get_permalink( $payout_page ) ) : '';
+	?>
+	<script type="text/javascript">
+	document.addEventListener('DOMContentLoaded', function () {
+		var banner = document.createElement('div');
+		banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:9998;background:#fff3cd;border-top:2px solid #ffe08a;color:#664d03;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;box-shadow:0 -2px 8px rgba(0,0,0,0.1);';
+		banner.innerHTML =
+			'<span><strong>⚠ <?php echo esc_js( __( 'Payout Account Alert:', 'truelysell' ) ); ?></strong> <?php echo esc_js( $message ); ?></span>' +
+			'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">' +
+			<?php if ( $payout_url ) : ?>
+			'<a href="<?php echo $payout_url; ?>" style="background:#ff9f43;color:#fff;padding:6px 14px;border-radius:4px;text-decoration:none;font-weight:600;white-space:nowrap;font-size:13px;"><?php echo esc_js( __( 'Connect Payout Method →', 'truelysell' ) ); ?></a>' +
+			<?php endif; ?>
+			'<button onclick="this.closest(\'div\').parentNode.style.display=\'none\';" style="background:none;border:none;cursor:pointer;font-size:20px;color:#664d03;padding:0 4px;line-height:1;" aria-label="Dismiss">×</button>' +
+			'</div>';
+		document.body.appendChild(banner);
+	});
+	</script>
+	<?php
 }
 
 // ============================================================
@@ -6525,6 +8228,42 @@ function custom_truelysell_include_postal_code_taxonomy_matches( $query ) {
 // Theme Options (Maps API Server field) so every Google Maps feature on
 // the site shares one key. Only used if that option is empty.
 define( 'TRUELYSELL_CHILD_GOOGLE_MAPS_API_KEY', 'AIzaSyADyKpKfpym_L-R_9BxGMzwp02wGEcllMM' );
+
+// ============================================================
+// OVERSIZED TV SURCHARGE
+// Every listing's own price covers TVs up to this size — anything larger
+// automatically adds the surcharge on top, both in the customer's booking
+// total and in every "Starting at" price display.
+// ============================================================
+define( 'TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES', 65 );
+define( 'TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE', 30 );
+
+/**
+ * A listing's base price — same _normal_price-else-_price lookup used
+ * throughout this file, centralized here so the surcharge logic and the
+ * booking form always agree with the AJAX handler on what the starting
+ * price actually is.
+ */
+function custom_truelysell_get_listing_base_price( $listing_id ) {
+	$price = (float) get_post_meta( $listing_id, '_normal_price', true );
+	if ( ! $price ) {
+		$price = (float) get_post_meta( $listing_id, '_price', true );
+	}
+	return $price;
+}
+
+/**
+ * TV size (inches) over the threshold adds a flat surcharge to a
+ * listing's base price — used both to show the customer an accurate
+ * running total in the booking form, and by the server when actually
+ * calculating the deposit.
+ */
+function custom_truelysell_apply_oversize_tv_surcharge( $base_price, $tv_size_inches ) {
+	if ( $tv_size_inches > TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES ) {
+		return $base_price + TRUELYSELL_CHILD_OVERSIZE_TV_SURCHARGE;
+	}
+	return $base_price;
+}
 
 // ============================================================
 // GOHIGHLEVEL (GHL) WEBHOOK INTEGRATION

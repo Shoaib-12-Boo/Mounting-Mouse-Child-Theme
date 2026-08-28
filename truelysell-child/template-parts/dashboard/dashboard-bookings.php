@@ -77,10 +77,15 @@ $status_colors = [
                             $status_color = $status_colors[ $booking->status ] ?? 'secondary';
                             $currency_symbol = function_exists( 'get_woocommerce_currency_symbol' ) ? get_woocommerce_currency_symbol() : '$';
                             $completion_state = function_exists( 'truelysell_get_booking_job_completion_state' ) ? truelysell_get_booking_job_completion_state( $booking ) : null;
+                            $customer_details_row = function_exists( 'truelysell_get_booking_customer_details' ) ? truelysell_get_booking_customer_details( $booking ) : array();
+                            $tv_details_row = function_exists( 'truelysell_format_booking_tv_details' ) ? truelysell_format_booking_tv_details( $customer_details_row ) : '';
                         ?>
                             <tr>
                                 <td>
                                     <strong><?php echo esc_html( $listing ? $listing->post_title : 'N/A' ); ?></strong>
+                                    <?php if ( $tv_details_row ) : ?>
+                                        <br><span class="fs-12 text-muted"><?php echo esc_html( $tv_details_row ); ?></span>
+                                    <?php endif; ?>
                                 </td>
                                 <td><?php echo esc_html( $technician ? $technician->display_name : 'N/A' ); ?></td>
                                 <td><?php echo esc_html( $booking_date ); ?></td>

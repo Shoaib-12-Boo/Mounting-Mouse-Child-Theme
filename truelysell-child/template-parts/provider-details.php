@@ -454,6 +454,7 @@ echo esc_html($normal_price);
  <?php if($initial_price_value) { ?>
      <span class="fs-13 text-gray"><del><?php echo esc_html($initial_price); ?></del></span>
  <?php } ?></h6>
+ <span class="fs-12 text-gray"><?php echo esc_html( sprintf( __( 'TVs up to %d"', 'truelysell' ), defined( 'TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES' ) ? TRUELYSELL_CHILD_OVERSIZE_TV_THRESHOLD_INCHES : 65 ) ); ?></span>
  </div>
  </div>
  </div>
