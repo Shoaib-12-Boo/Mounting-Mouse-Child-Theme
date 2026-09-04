@@ -1,4 +1,4 @@
-/*
+﻿/*
 Theme Name: Truelysell Child
 Theme URI: https://dreamstechnologies.com/
 Template: truelysell
@@ -125,3 +125,288 @@ Updated: 2026-06-24 17:42:55
 	padding: 8px 12px;
 }
 
+
+/* ============================================================
+   KidsVerse — Shop Page as Single Product Layout
+   ============================================================ */
+
+/* ── Full-width shop container ─────────────────────────── */
+.truelysell-shop-grid,
+.truelysell-shop-grid .container,
+.truelysell-shop-grid .row,
+.truelysell-shop-grid article {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+
+/* ── Reset list item for single layout ────────────────── */
+ul.products { display: block !important; margin: 0 !important; padding: 0 !important; }
+ul.products li.kv-shop-as-single {
+    width: 100% !important;
+    float: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    list-style: none !important;
+    clear: both;
+}
+
+/* ── Wrapper: 2-column like single product page ────────── */
+.kv-single-wrapper {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    width: 100%;
+    min-height: 80vh;
+    align-items: flex-start;
+}
+
+/* ── Left: WooCommerce product images ──────────────────── */
+.kv-single-wrapper .woocommerce-product-gallery {
+    flex: 0 0 55%;
+    max-width: 55%;
+    padding: 32px 40px 32px 32px;
+    position: sticky;
+    top: 0;
+    background: #f8f8f8;
+}
+
+.kv-single-wrapper .woocommerce-product-gallery .woocommerce-product-gallery__image img {
+    width: 100%;
+    height: auto;
+    border-radius: 6px;
+}
+
+.kv-single-wrapper .woocommerce-product-gallery .flex-control-thumbs {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    padding: 0;
+    list-style: none;
+}
+.kv-single-wrapper .flex-control-thumbs li { margin: 0; }
+.kv-single-wrapper .flex-control-thumbs img {
+    width: 72px !important;
+    height: 72px !important;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: border-color 0.2s;
+}
+.kv-single-wrapper .flex-control-thumbs img:hover,
+.kv-single-wrapper .flex-control-thumbs .flex-active {
+    border-color: #1a1a1a !important;
+}
+
+/* ── Right: Product Summary ────────────────────────────── */
+.kv-single-summary {
+    flex: 0 0 45%;
+    max-width: 45%;
+    padding: 48px 48px 48px 40px;
+    background: #fff;
+    min-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+}
+
+/* Title */
+.kv-single-summary .product_title {
+    font-size: clamp(28px, 3vw, 42px) !important;
+    font-weight: 700 !important;
+    line-height: 1.2 !important;
+    color: #1a1a1a !important;
+    margin: 0 0 10px !important;
+}
+
+/* Rating */
+.kv-single-summary .woocommerce-product-rating {
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Price */
+.kv-single-summary .price {
+    font-size: 28px !important;
+    font-weight: 600 !important;
+    color: #1a1a1a !important;
+    margin-bottom: 18px !important;
+    display: block;
+}
+.kv-single-summary .price del { color: #999 !important; font-size: 18px !important; }
+.kv-single-summary .price ins { text-decoration: none !important; color: #16a34a !important; }
+
+/* Short description */
+.kv-single-summary .woocommerce-product-details__short-description {
+    font-size: 15px;
+    line-height: 1.75;
+    color: #555;
+    margin-bottom: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid #eee;
+}
+
+/* ── Add to Cart Form — qty + button ──────────────────── */
+.kv-single-summary form.cart {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-bottom: 20px;
+}
+
+/* Quantity box */
+.kv-single-summary .quantity {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    border: 1.5px solid #ddd;
+    border-radius: 4px;
+    overflow: hidden;
+    width: fit-content;
+    background: #fff;
+}
+
+.kv-single-summary .qty {
+    width: 56px;
+    height: 48px;
+    text-align: center;
+    font-size: 16px;
+    font-weight: 600;
+    border: none;
+    border-left: 1.5px solid #ddd;
+    border-right: 1.5px solid #ddd;
+    background: #fff;
+    outline: none;
+    color: #1a1a1a;
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+.kv-single-summary .qty::-webkit-outer-spin-button,
+.kv-single-summary .qty::-webkit-inner-spin-button { -webkit-appearance: none; }
+
+/* Qty +/- buttons added via JS from WooCommerce */
+.kv-single-summary .qty-minus,
+.kv-single-summary .qty-plus,
+.kv-single-summary .minus,
+.kv-single-summary .plus {
+    width: 44px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: #f8f8f8;
+    color: #1a1a1a;
+    font-size: 18px;
+    cursor: pointer;
+    transition: background 0.15s;
+    padding: 0;
+}
+.kv-single-summary .qty-minus:hover,
+.kv-single-summary .qty-plus:hover,
+.kv-single-summary .minus:hover,
+.kv-single-summary .plus:hover { background: #efefef; }
+
+/* ── BUY NOW BUTTON ──────────────────────────────────── */
+.kv-single-summary .single_add_to_cart_button,
+.kv-single-summary button[type="submit"].button {
+    display: block !important;
+    width: 100% !important;
+    padding: 17px 24px !important;
+    background: #1a1a1a !important;
+    color: #fff !important;
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    letter-spacing: 1px !important;
+    text-transform: uppercase !important;
+    border: 2px solid #1a1a1a !important;
+    border-radius: 4px !important;
+    cursor: pointer !important;
+    transition: background 0.2s, color 0.2s !important;
+    text-align: center !important;
+    line-height: 1.4 !important;
+}
+.kv-single-summary .single_add_to_cart_button:hover,
+.kv-single-summary button[type="submit"].button:hover {
+    background: #fff !important;
+    color: #1a1a1a !important;
+}
+
+/* Product meta (SKU, Category) */
+.kv-single-summary .product_meta {
+    font-size: 13px;
+    color: #888;
+    margin-top: 10px;
+    padding-top: 16px;
+    border-top: 1px solid #eee;
+}
+.kv-single-summary .product_meta span { display: block; margin-bottom: 4px; }
+.kv-single-summary .product_meta a { color: #555; }
+
+/* ── Tabs + Related below ────────────────────────────── */
+.kv-shop-as-single .woocommerce-tabs {
+    padding: 48px 40px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+.kv-shop-as-single .woocommerce-tabs ul.tabs {
+    border-bottom: 2px solid #eee;
+    padding: 0;
+    margin-bottom: 28px;
+}
+.kv-shop-as-single .woocommerce-tabs ul.tabs li a {
+    font-weight: 600;
+    color: #666;
+    padding: 12px 20px;
+    font-size: 14px;
+}
+.kv-shop-as-single .woocommerce-tabs ul.tabs li.active a { color: #1a1a1a; }
+.kv-shop-as-single .woocommerce-tabs .panel { font-size: 15px; line-height: 1.8; color: #444; }
+
+/* ── Hide shop header (count/sort) ──────────────────── */
+.truelysell-shop-grid .woocommerce-result-count,
+.truelysell-shop-grid .woocommerce-ordering { display: none !important; }
+
+/* ── Responsive ─────────────────────────────────────── */
+@media (max-width: 900px) {
+    .kv-single-wrapper { flex-direction: column; }
+    .kv-single-wrapper .woocommerce-product-gallery,
+    .kv-single-summary {
+        flex: 0 0 100%;
+        max-width: 100%;
+        padding: 24px;
+        position: static;
+        min-height: auto;
+    }
+}
+/* listing_package single product layout fix */
+ul.products li.plan.kv-shop-as-single,
+ul.products li.featured.kv-shop-as-single {
+    width: 100% !important;
+    float: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    list-style: none !important;
+}
+
+/* Hide the old plan/listing card wrappers */
+ul.products li.kv-shop-as-single .plan-price,
+ul.products li.kv-shop-as-single .plan-features,
+ul.products li.kv-shop-as-single .listing-badge { display: none !important; }
+
+/* Remove WooCommerce before-loop elements on shop */
+.woocommerce-result-count { display: none !important; }
+.woocommerce-ordering { display: none !important; }

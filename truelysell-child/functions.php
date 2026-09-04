@@ -8822,3 +8822,69 @@ function custom_truelysell_listing_availability_save_script() {
 	</script>
 	<?php
 }
+
+// ============================================================
+// KidsVerse — Shop Page: Direct Checkout (Skip Cart)
+// ============================================================
+
+/**
+ * 1. Redirect "Add to Cart" straight to checkout page.
+ *    Works for both AJAX and non-AJAX add-to-cart.
+ */
+add_filter( 'woocommerce_add_to_cart_redirect', 'kv_skip_cart_go_checkout', 99 );
+function kv_skip_cart_go_checkout( $url ) {
+    return wc_get_checkout_url();
+}
+
+/**
+ * 2. Also disable the "View Cart" notice after adding to cart,
+ *    since we're going directly to checkout anyway.
+ */
+add_filter( 'wc_add_to_cart_message_html', '__return_empty_string', 99 );
+
+/**
+ * 3. Remove shop page columns / result count / ordering bar
+ *    so single product fills the full width cleanly.
+ */
+add_action( 'wp', 'kv_shop_single_product_setup' );
+function kv_shop_single_product_setup() {
+    if ( ! is_shop() && ! is_product_category() && ! is_product_tag() ) return;
+
+    // Show 1 product per row (only 1 product anyway)
+    add_filter( 'loop_shop_columns', function() { return 1; } );
+
+    // Remove result count + ordering dropdowns from shop header
+    remove_action( 'woocommerce_before_shop_loop', 'woocommerce_result_count', 20 );
+    remove_action( 'woocommerce_before_shop_loop', 'woocommerce_catalog_ordering', 30 );
+
+    // Remove pagination (1 product = no pagination needed)
+    remove_action( 'woocommerce_after_shop_loop', 'woocommerce_pagination', 10 );
+
+    // Remove the "X products" breadcrumb count
+    remove_action( 'woocommerce_before_shop_loop', 'woocommerce_result_count', 20 );
+}
+
+/**
+ * 4. On the single-product summary shown in the shop loop,
+ *    change the add-to-cart button label to "Buy Now — Checkout".
+ */
+add_filter( 'woocommerce_product_single_add_to_cart_text', 'kv_change_atc_text', 99 );
+function kv_change_atc_text( $text ) {
+    return esc_html__( 'Buy Now — Checkout', 'truelysell' );
+}
+
+// ============================================================
+// End KidsVerse Shop Customizations
+// ============================================================
+
+// ── listing_package: override add-to-cart text + enable checkout redirect ──
+add_filter( 'woocommerce_product_add_to_cart_text', 'kv_listing_pkg_btn_text', 99, 2 );
+function kv_listing_pkg_btn_text( $text, $product ) {
+    return esc_html__( 'Buy Now - Checkout', 'truelysell' );
+}
+
+// Make listing_package show add-to-cart form like a simple product on shop page
+add_filter( 'woocommerce_is_purchasable', '__return_true', 99 );
+
+// Force listing_package to show the standard single-product add-to-cart form
+add_action( 'woocommerce_listing_package_add_to_cart', 'woocommerce_simple_add_to_cart', 30 );
